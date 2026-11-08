@@ -1,0 +1,49 @@
+name: Bauen & veröffentlichen
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 3 1 * *'   # monatlich frische Strassendaten
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: month
+        run: echo "key=$(date +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: public/data/roads.json
+          key: roads-zh-v1-${{ steps.month.outputs.key }}
+      - name: Strassennetz Kanton Zürich laden (OpenStreetMap)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: node scripts/build-roads.mjs public/data/roads.json
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

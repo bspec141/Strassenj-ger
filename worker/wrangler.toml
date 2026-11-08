@@ -1,0 +1,9 @@
+# Nur nötig, wenn du den Worker per Kommandozeile (wrangler) statt im Dashboard einrichtest.
+name = "strassenjaeger"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "strassenjaeger"
+database_id = "HIER-DATABASE-ID-EINTRAGEN"

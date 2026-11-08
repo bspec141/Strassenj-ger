@@ -1,0 +1,820 @@
+'use strict';
+(() => {
+// ───────────────────────── Konfiguration ─────────────────────────
+const STYLE_URL = 'https://tiles.openfreemap.org/styles/dark';
+const ROADS_URL = 'data/roads.json';
+const CENTER = [8.65, 47.40];
+
+const CLASS_LABEL = ['Autobahn', 'Autostrasse', 'Hauptstrasse', 'Hauptstrasse', 'Verbindungsstrasse',
+  'Gemeindestrasse', 'Quartierstrasse', 'Begegnungszone'];
+const GROUPS = [
+  ['Autobahnen & Autostrassen', [0, 1]],
+  ['Hauptstrassen', [2, 3]],
+  ['Verbindungs- & Gemeindestrassen', [4, 5]],
+  ['Quartierstrassen', [6, 7]],
+];
+
+// Lokale Projektion (Meter), genau genug für den Kanton Zürich
+const LON0 = 8.65, LAT0 = 47.40, KX = 75489, KY = 111180;
+const px = lon => (lon - LON0) * KX, py = lat => (lat - LAT0) * KY;
+const ux = x => x / KX + LON0, uy = y => y / KY + LAT0;
+
+const SUB = 25;          // max. Länge eines Teilsegments (m)
+const CHUNK = 50;        // Länge eines "Erkundungs-Stücks" (m)
+const CELL = 50;         // Rastergrösse Suchindex (m)
+const MATCH_R = 20;      // GPS-Punkt muss so nah an der Strasse sein (m)
+const MIN_SPEED = 2.2;   // m/s – langsamer = zu Fuss/Stillstand, zählt nicht
+const MAX_SPEED = 75;    // m/s – schneller = GPS-Sprung
+const MAX_ACC = 40;      // m – ungenauere Punkte ignorieren
+const STEP = 8;          // Interpolationsschritt (m)
+const MAX_GAP_T = 180e3, MAX_GAP_D = 1500;
+const TRIP_GAP = 10 * 60e3;
+const COS_HEADING = Math.cos(40 * Math.PI / 180);
+
+// ───────────────────────── Zustand ─────────────────────────
+let cfg = loadCfg();
+let ROADS = null;        // Rohdaten
+let R = null;            // Index (Strassen, Stücke, Segmente, Raster)
+let CF = null;           // Float64Array: Zeitpunkt der ersten Befahrung je Stück (0 = nie)
+let batches = [];        // gespeicherte Punkt-Pakete
+let P = emptyPoints();   // sortierte, deduplizierte Punkte
+let tags = {};           // Fahrt-Start → 'car' | 'moto'
+let map = null, geo = null, mapReady = false;
+let lastSync = 0;
+let explore = { excludeWays: new Set(), excludeNames: new Set(), origin: null };
+
+const $ = id => document.getElementById(id);
+
+// ───────────────────────── Hilfsfunktionen ─────────────────────────
+function loadCfg() {
+  const d = { url: '', token: '', gmApp: true, motorway: false, network: true };
+  try { return { ...d, ...JSON.parse(localStorage.getItem('erkunder-cfg') || '{}') }; } catch { return d; }
+}
+function saveCfg() { try { localStorage.setItem('erkunder-cfg', JSON.stringify(cfg)); } catch {} }
+
+const nf1 = new Intl.NumberFormat('de-CH', { maximumFractionDigits: 1, minimumFractionDigits: 1 });
+const nf0 = new Intl.NumberFormat('de-CH', { maximumFractionDigits: 0 });
+const km = m => (m >= 100000 ? nf0 : nf1).format(m / 1000);
+const pct = (a, b) => b > 0 ? nf1.format(100 * a / b) : '0,0';
+function dur(ms) {
+  const m = Math.round(ms / 60000);
+  return m < 60 ? `${m} Min` : `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')}`;
+}
+const dateFmt = new Intl.DateTimeFormat('de-CH', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+const timeFmt = new Intl.DateTimeFormat('de-CH', { hour: '2-digit', minute: '2-digit' });
+function ago(ts) {
+  const s = (Date.now() - ts) / 1000;
+  if (s < 90) return 'gerade eben';
+  if (s < 3600) return `vor ${Math.round(s / 60)} Min`;
+  if (s < 86400) return `vor ${Math.round(s / 3600)} h`;
+  return `vor ${Math.round(s / 86400)} Tagen`;
+}
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function lowerBound(arr, n, v) { let lo = 0, hi = n; while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] < v) lo = m + 1; else hi = m; } return lo; }
+
+let toastTimer;
+function toast(msg, ms = 3500) {
+  const el = $('toast'); el.textContent = msg; el.classList.remove('hidden');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.add('hidden'), ms);
+}
+function setLoading(text) {
+  if (text == null) { $('loading').classList.add('hidden'); return; }
+  $('loading').classList.remove('hidden'); $('loadingText').textContent = text;
+}
+const tick = () => new Promise(r => setTimeout(r, 0));
+
+// ───────────────────────── IndexedDB ─────────────────────────
+const idb = {
+  db: null,
+  open() {
+    return new Promise((res) => {
+      try {
+        const r = indexedDB.open('erkunder', 1);
+        r.onupgradeneeded = () => { r.result.createObjectStore('batches', { autoIncrement: true }); r.result.createObjectStore('kv'); };
+        r.onsuccess = () => { this.db = r.result; res(); };
+        r.onerror = () => res();
+      } catch { res(); }
+    });
+  },
+  run(store, mode, fn) {
+    if (!this.db) return Promise.resolve(undefined);
+    return new Promise((res) => {
+      try {
+        const t = this.db.transaction(store, mode);
+        const req = fn(t.objectStore(store));
+        t.oncomplete = () => res(req ? req.result : undefined);
+        t.onerror = t.onabort = () => res(undefined);
+      } catch { res(undefined); }
+    });
+  },
+  get(k) { return this.run('kv', 'readonly', s => s.get(k)); },
+  set(k, v) { return this.run('kv', 'readwrite', s => s.put(v, k)); },
+  addBatch(b) { return this.run('batches', 'readwrite', s => s.add(b)); },
+  allBatches() { return this.run('batches', 'readonly', s => s.getAll()).then(r => r || []); },
+  async clear() { await this.run('batches', 'readwrite', s => s.clear()); await this.run('kv', 'readwrite', s => s.clear()); },
+};
+
+// ───────────────────────── GPS-Punkte ─────────────────────────
+function emptyPoints() { return { n: 0, t: new Float64Array(0), lat: new Float64Array(0), lon: new Float64Array(0), acc: new Float32Array(0), spd: new Float32Array(0) }; }
+
+function buildPoints(list) {
+  let total = 0;
+  for (const b of list) total += b.t.length;
+  const T = new Float64Array(total), LA = new Float64Array(total), LO = new Float64Array(total),
+    AC = new Float32Array(total), SP = new Float32Array(total);
+  let k = 0;
+  for (const b of list) {
+    for (let i = 0; i < b.t.length; i++, k++) {
+      T[k] = b.t[i]; LA[k] = b.lat[i]; LO[k] = b.lon[i];
+      AC[k] = b.acc[i] == null ? NaN : b.acc[i];
+      SP[k] = b.spd[i] == null ? NaN : b.spd[i];
+    }
+  }
+  const idx = new Uint32Array(total);
+  for (let i = 0; i < total; i++) idx[i] = i;
+  idx.sort((a, b) => T[a] - T[b]);
+  const out = { n: 0, t: new Float64Array(total), lat: new Float64Array(total), lon: new Float64Array(total),
+    acc: new Float32Array(total), spd: new Float32Array(total) };
+  let last = -Infinity;
+  for (let j = 0; j < total; j++) {
+    const i = idx[j];
+    if (T[i] === last || !Number.isFinite(T[i])) continue;
+    last = T[i];
+    const n = out.n++;
+    out.t[n] = T[i]; out.lat[n] = LA[i]; out.lon[n] = LO[i]; out.acc[n] = AC[i]; out.spd[n] = SP[i];
+  }
+  return out;
+}
+
+// ───────────────────────── Strassennetz ─────────────────────────
+function buildRoads(data) {
+  const W = data.ways.length;
+  const wayClass = new Uint8Array(W), wayName = new Uint32Array(W), wayLen = new Float32Array(W);
+  const wayChunk0 = new Uint32Array(W + 1);
+  const lines = new Array(W);
+  const sax = [], say = [], sbx = [], sby = [], segChunk = [];
+  const chunkWay = [], chunkLen = [], chunkSeg0 = [];
+  const classLen = new Float64Array(data.classes.length);
+
+  for (let w = 0; w < W; w++) {
+    const row = data.ways[w];
+    wayClass[w] = row[0]; wayName[w] = row[1];
+    wayChunk0[w] = chunkWay.length;
+    const coords = [], X = [], Y = [];
+    let ix = 0, iy = 0;
+    for (let i = 2; i < row.length; i += 2) {
+      ix += row[i]; iy += row[i + 1];
+      const lon = ix / 1e5, lat = iy / 1e5;
+      coords.push([lon, lat]); X.push(px(lon)); Y.push(py(lat));
+    }
+    lines[w] = coords;
+
+    let acc = 0, total = 0, startSeg = sax.length;
+    for (let i = 1; i < X.length; i++) {
+      const ax = X[i - 1], ay = Y[i - 1], dx = X[i] - ax, dy = Y[i] - ay;
+      const L = Math.hypot(dx, dy);
+      if (L === 0) continue;
+      const n = Math.max(1, Math.ceil(L / SUB));
+      for (let k = 0; k < n; k++) {
+        sax.push(ax + dx * k / n); say.push(ay + dy * k / n);
+        sbx.push(ax + dx * (k + 1) / n); sby.push(ay + dy * (k + 1) / n);
+        segChunk.push(chunkWay.length);
+        acc += L / n; total += L / n;
+        if (acc >= CHUNK) {
+          chunkWay.push(w); chunkLen.push(acc); chunkSeg0.push(startSeg);
+          startSeg = sax.length; acc = 0;
+        }
+      }
+    }
+    if (sax.length > startSeg) {
+      const hasPrev = chunkWay.length > wayChunk0[w];
+      if (hasPrev && acc < CHUNK / 2) {
+        const last = chunkWay.length - 1;
+        chunkLen[last] += acc;
+        for (let s = startSeg; s < sax.length; s++) segChunk[s] = last;
+      } else {
+        chunkWay.push(w); chunkLen.push(acc); chunkSeg0.push(startSeg);
+      }
+    }
+    wayLen[w] = total;
+    classLen[row[0]] += total;
+  }
+  wayChunk0[W] = chunkWay.length;
+  chunkSeg0.push(sax.length);
+
+  const S = sax.length;
+  const SAX = Float32Array.from(sax), SAY = Float32Array.from(say), SBX = Float32Array.from(sbx), SBY = Float32Array.from(sby);
+  const grid = new Map();
+  for (let s = 0; s < S; s++) {
+    const x0 = Math.floor((Math.min(SAX[s], SBX[s]) - MATCH_R) / CELL), x1 = Math.floor((Math.max(SAX[s], SBX[s]) + MATCH_R) / CELL);
+    const y0 = Math.floor((Math.min(SAY[s], SBY[s]) - MATCH_R) / CELL), y1 = Math.floor((Math.max(SAY[s], SBY[s]) + MATCH_R) / CELL);
+    for (let cx = x0; cx <= x1; cx++) for (let cy = y0; cy <= y1; cy++) {
+      const key = cellKey(cx, cy);
+      let a = grid.get(key);
+      if (!a) grid.set(key, a = []);
+      a.push(s);
+    }
+  }
+  let totalLen = 0;
+  for (const l of classLen) totalLen += l;
+
+  return {
+    W, C: chunkWay.length, S, wayClass, wayName, wayLen, wayChunk0, lines, names: data.names,
+    SAX, SAY, SBX, SBY, segChunk: Uint32Array.from(segChunk),
+    chunkWay: Uint32Array.from(chunkWay), chunkLen: Float32Array.from(chunkLen), chunkSeg0: Uint32Array.from(chunkSeg0),
+    grid, classLen, totalLen, version: data.generated,
+  };
+}
+function cellKey(cx, cy) { return (cx + 5000) * 10000 + (cy + 5000); }
+
+// Nächstes Segment zu (x,y); optional mit Fahrtrichtung (hx,hy)
+function nearestSeg(x, y, hx, hy, r, wide) {
+  const cx = Math.floor(x / CELL), cy = Math.floor(y / CELL);
+  let best = -1, bd = r * r;
+  const span = wide ? 1 : 0;
+  for (let ox = -span; ox <= span; ox++) for (let oy = -span; oy <= span; oy++) {
+    const arr = R.grid.get(cellKey(cx + ox, cy + oy));
+    if (!arr) continue;
+    for (let i = 0; i < arr.length; i++) {
+      const s = arr[i];
+      const ax = R.SAX[s], ay = R.SAY[s], dx = R.SBX[s] - ax, dy = R.SBY[s] - ay;
+      const L2 = dx * dx + dy * dy;
+      let u = L2 > 0 ? ((x - ax) * dx + (y - ay) * dy) / L2 : 0;
+      u = u < 0 ? 0 : u > 1 ? 1 : u;
+      const ex = ax + u * dx - x, ey = ay + u * dy - y, d2 = ex * ex + ey * ey;
+      if (d2 >= bd) continue;
+      if ((hx || hy) && L2 > 0 && Math.abs(dx * hx + dy * hy) / Math.sqrt(L2) < COS_HEADING) continue;
+      bd = d2; best = s;
+    }
+  }
+  return best;
+}
+
+// ───────────────────────── Abdeckung berechnen ─────────────────────────
+// Verarbeitet alle Punktpaare ab Zeitpunkt tFrom. Idempotent: CF = frühester Zeitpunkt.
+function processFrom(tFrom) {
+  const { t, lat, lon, acc, n } = P;
+  let i = Number.isFinite(tFrom) ? lowerBound(t, n, tFrom) : 0;
+  if (i > 0) i--;
+  let newly = 0, prev = -1;
+  const mark = (c, ts) => {
+    const cur = CF[c];
+    if (cur === 0) { newly += R.chunkLen[c]; CF[c] = ts; }
+    else if (ts < cur) CF[c] = ts;
+  };
+  for (; i < n; i++) {
+    if (acc[i] > MAX_ACC) continue;
+    if (prev >= 0) {
+      const dt = t[i] - t[prev];
+      const ax = px(lon[prev]), ay = py(lat[prev]), bx = px(lon[i]), by = py(lat[i]);
+      const d = Math.hypot(bx - ax, by - ay);
+      const v = d / (dt / 1000);
+      if (dt > 0 && dt <= MAX_GAP_T && d <= MAX_GAP_D && v >= MIN_SPEED && v <= MAX_SPEED) {
+        const hx = (bx - ax) / d, hy = (by - ay) / d;
+        const steps = Math.max(1, Math.ceil(d / STEP));
+        for (let k = 0; k <= steps; k++) {
+          const f = k / steps;
+          const s = nearestSeg(ax + (bx - ax) * f, ay + (by - ay) * f, hx, hy, MATCH_R, false);
+          if (s >= 0) mark(R.segChunk[s], t[prev] + dt * f);
+        }
+      }
+    }
+    prev = i;
+  }
+  return newly;
+}
+
+async function saveCoverage() {
+  await idb.set('coverage', { version: R.version, n: P.n, cf: CF.buffer.slice(0) });
+}
+
+// ───────────────────────── Fahrten & Statistik ─────────────────────────
+function computeTrips() {
+  const { t, lat, lon, acc, spd, n } = P;
+  const trips = [];
+  let cur = null, prev = -1, ref = -1;
+  const close = () => { if (cur && cur.dist >= 500) trips.push(cur); };
+  for (let i = 0; i < n; i++) {
+    if (acc[i] > MAX_ACC) continue;
+    if (prev < 0 || t[i] - t[prev] > TRIP_GAP) {
+      close();
+      cur = { start: t[i], end: t[i], dist: 0, moving: 0, maxSpd: 0, maxCalc: 0, newLen: 0 };
+      ref = i;
+    } else {
+      const dt = t[i] - t[prev];
+      const d = Math.hypot(px(lon[i]) - px(lon[prev]), py(lat[i]) - py(lat[prev]));
+      const v = d / (dt / 1000);
+      if (dt > 0 && v >= MIN_SPEED && v <= MAX_SPEED) {
+        cur.dist += d; cur.moving += dt;
+      }
+      cur.end = t[i];
+      // Geschwindigkeit über mind. 5 s gemittelt (für GPX ohne Geschwindigkeitsangabe)
+      const rdt = t[i] - t[ref];
+      if (rdt >= 5000) {
+        const rv = Math.hypot(px(lon[i]) - px(lon[ref]), py(lat[i]) - py(lat[ref])) / (rdt / 1000);
+        if (rdt <= 60000 && rv <= MAX_SPEED && rv > cur.maxCalc) cur.maxCalc = rv;
+        ref = i;
+      }
+    }
+    if (spd[i] > 0 && spd[i] < MAX_SPEED && !(acc[i] > 25) && spd[i] > cur.maxSpd) cur.maxSpd = spd[i];
+    prev = i;
+  }
+  close();
+  for (const tr of trips) tr.top = tr.maxSpd > 0 ? tr.maxSpd : tr.maxCalc;
+  // Neu erkundete Strecke je Fahrt
+  const starts = trips.map(tr => tr.start);
+  for (let c = 0; c < R.C; c++) {
+    const f = CF[c];
+    if (!f) continue;
+    const k = lowerBound(starts, starts.length, f + 1) - 1;
+    if (k >= 0 && f <= trips[k].end + 1000) trips[k].newLen += R.chunkLen[c];
+  }
+  return trips;
+}
+
+function coverageStats() {
+  const classDriven = new Float64Array(R.classLen.length);
+  let driven = 0, drivenWeek = 0, drivenMonth = 0;
+  const now = Date.now(), weekAgo = now - 7 * 864e5, monthAgo = now - 30 * 864e5;
+  // Wochen-Balken (letzte 12 Wochen, ab Montag)
+  const monday = new Date(); monday.setHours(0, 0, 0, 0); monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7));
+  const weeks = new Float64Array(12);
+  const w0 = monday.getTime() - 11 * 7 * 864e5;
+  for (let c = 0; c < R.C; c++) {
+    const f = CF[c];
+    if (!f) continue;
+    const L = R.chunkLen[c];
+    driven += L;
+    classDriven[R.wayClass[R.chunkWay[c]]] += L;
+    if (f >= weekAgo) drivenWeek += L;
+    if (f >= monthAgo) drivenMonth += L;
+    if (f >= w0) weeks[Math.min(11, Math.floor((f - w0) / (7 * 864e5)))] += L;
+  }
+  return { driven, drivenWeek, drivenMonth, classDriven, weeks, w0 };
+}
+
+// ───────────────────────── Karte ─────────────────────────
+async function initMap() {
+  let style;
+  try {
+    const r = await fetch(STYLE_URL);
+    if (!r.ok) throw 0;
+    style = await r.json();
+    for (const l of style.layers) {
+      if (l.type === 'line' && l['source-layer'] === 'transportation') {
+        l.paint = { ...(l.paint || {}), 'line-opacity': 0.25 };
+      }
+    }
+  } catch {
+    style = { version: 8, sources: {}, layers: [{ id: 'bg', type: 'background', paint: { 'background-color': '#0e121a' } }] };
+  }
+  map = new maplibregl.Map({
+    container: 'map', style, center: CENTER, zoom: 9.6, minZoom: 7, maxZoom: 19,
+    dragRotate: false, pitchWithRotate: false, attributionControl: { compact: true },
+  });
+  map.touchZoomRotate.disableRotation();
+  geo = new maplibregl.GeolocateControl({ positionOptions: { enableHighAccuracy: true }, trackUserLocation: true, showAccuracyCircle: false });
+  map.addControl(geo, 'top-right');
+  map.addControl(new maplibregl.AttributionControl({ compact: true, customAttribution: '© OpenStreetMap' }));
+
+  await new Promise(res => map.on('load', res));
+  const before = map.getStyle().layers.find(l => l.type === 'symbol')?.id;
+  map.addSource('network', { type: 'geojson', data: empty(), tolerance: 0.5 });
+  map.addSource('driven', { type: 'geojson', data: empty(), tolerance: 0.3 });
+  map.addSource('target', { type: 'geojson', data: empty() });
+
+  const w = (a, b, c, d) => ['interpolate', ['exponential', 1.6], ['zoom'], 8, a, 12, b, 15, c, 18, d];
+  const cf = ['match', ['get', 'c'], [0, 1], 1.6, [2, 3], 1.3, 1];
+  const wc = (a, b, c, d) => ['interpolate', ['exponential', 1.6], ['zoom'], 8, ['*', cf, a], 12, ['*', cf, b], 15, ['*', cf, c], 18, ['*', cf, d]];
+  map.addLayer({ id: 'network', type: 'line', source: 'network',
+    layout: { 'line-cap': 'round', 'line-join': 'round', visibility: cfg.network ? 'visible' : 'none' },
+    paint: { 'line-color': '#6f7a8c', 'line-opacity': 0.55,
+      'line-width': wc(0.3, 0.9, 2.2, 6) } }, before);
+  const col = ['case', ['get', 'r'], '#ffb300', '#00e5ff'];
+  map.addLayer({ id: 'driven-glow', type: 'line', source: 'driven', layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': col, 'line-opacity': 0.35, 'line-blur': w(2, 3, 5, 8), 'line-width': w(3, 5, 11, 26) } }, before);
+  map.addLayer({ id: 'driven', type: 'line', source: 'driven', layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': col, 'line-width': w(0.9, 1.8, 3.6, 9) } }, before);
+  map.addLayer({ id: 'target-line', type: 'line', source: 'target', filter: ['==', ['geometry-type'], 'LineString'],
+    layout: { 'line-cap': 'round' }, paint: { 'line-color': '#ff3df2', 'line-width': w(3, 5, 9, 16), 'line-opacity': 0.85, 'line-dasharray': [1.5, 1] } });
+  map.addLayer({ id: 'target-pt', type: 'circle', source: 'target', filter: ['==', ['geometry-type'], 'Point'],
+    paint: { 'circle-radius': 9, 'circle-color': '#ff3df2', 'circle-stroke-color': '#fff', 'circle-stroke-width': 2.5 } });
+
+  map.on('click', onMapClick);
+  mapReady = true;
+}
+const empty = () => ({ type: 'FeatureCollection', features: [] });
+
+function renderNetwork() {
+  if (!mapReady) return;
+  const feats = new Array(R.W);
+  for (let w = 0; w < R.W; w++) feats[w] = { type: 'Feature', properties: { c: R.wayClass[w] }, geometry: { type: 'LineString', coordinates: R.lines[w] } };
+  map.getSource('network').setData({ type: 'FeatureCollection', features: feats });
+}
+
+function renderDriven() {
+  if (!mapReady) return;
+  const feats = [];
+  const recent = Date.now() - 7 * 864e5;
+  for (let w = 0; w < R.W; w++) {
+    const c0 = R.wayChunk0[w], c1 = R.wayChunk0[w + 1];
+    let runStart = -1, runRecent = false;
+    for (let c = c0; c <= c1; c++) {
+      const on = c < c1 && CF[c] > 0;
+      const rec = on && CF[c] >= recent;
+      if (runStart >= 0 && (!on || rec !== runRecent)) {
+        feats.push(chunkLine(runStart, c, runRecent));
+        runStart = -1;
+      }
+      if (on && runStart < 0) { runStart = c; runRecent = rec; }
+    }
+  }
+  map.getSource('driven').setData({ type: 'FeatureCollection', features: feats });
+}
+function chunkLine(cFrom, cTo, recent) {
+  const s0 = R.chunkSeg0[cFrom], s1 = R.chunkSeg0[cTo];
+  const coords = [[ux(R.SAX[s0]), uy(R.SAY[s0])]];
+  for (let s = s0; s < s1; s++) coords.push([ux(R.SBX[s]), uy(R.SBY[s])]);
+  return { type: 'Feature', properties: { r: recent }, geometry: { type: 'LineString', coordinates: coords } };
+}
+
+function onMapClick(e) {
+  const { lng, lat } = e.lngLat;
+  const s = nearestSeg(px(lng), py(lat), 0, 0, 35, true);
+  let html;
+  let dest = [lat, lng];
+  if (s >= 0) {
+    const c = R.segChunk[s], w = R.chunkWay[c];
+    const name = R.names[R.wayName[w]] || CLASS_LABEL[R.wayClass[w]];
+    const f = CF[c];
+    const status = f ? `<span class="ok">Erkundet am ${new Date(f).toLocaleDateString('de-CH')}</span>` : '<span style="color:#ffb300">Noch nicht erkundet</span>';
+    dest = [uy((R.SAY[s] + R.SBY[s]) / 2), ux((R.SAX[s] + R.SBX[s]) / 2)];
+    html = `<b>${esc(name)}</b><br><span style="color:#8a93a3">${CLASS_LABEL[R.wayClass[w]]}</span><br>${status}`;
+  } else {
+    html = '<b>Kein erfasster Strassenabschnitt</b>';
+  }
+  html += `<br><a class="btn primary" style="margin-top:8px;padding:7px 10px" href="${navUrl(dest[0], dest[1])}" target="_blank" rel="noopener">Hierhin navigieren</a>`;
+  new maplibregl.Popup({ closeButton: false, maxWidth: '260px' }).setLngLat(e.lngLat).setHTML(html).addTo(map);
+}
+
+// ───────────────────────── Erkunden ─────────────────────────
+function navUrl(lat, lon) {
+  const ll = `${lat.toFixed(6)},${lon.toFixed(6)}`;
+  return cfg.gmApp
+    ? `comgooglemaps://?daddr=${ll}&directionsmode=driving`
+    : `https://www.google.com/maps/dir/?api=1&destination=${ll}&travelmode=driving`;
+}
+
+function getPosition() {
+  return new Promise(res => {
+    if (!navigator.geolocation) return res(null);
+    navigator.geolocation.getCurrentPosition(
+      p => res([p.coords.longitude, p.coords.latitude]),
+      () => res(null), { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 });
+  });
+}
+
+function findTarget(lon, lat) {
+  const wayDriven = new Float64Array(R.W);
+  for (let c = 0; c < R.C; c++) if (CF[c]) wayDriven[R.chunkWay[c]] += R.chunkLen[c];
+  const x = px(lon), y = py(lat);
+  let best = -1, bd = Infinity;
+  for (let c = 0; c < R.C; c++) {
+    if (CF[c]) continue;
+    const w = R.chunkWay[c];
+    if (!cfg.motorway && R.wayClass[w] === 0) continue;
+    if (explore.excludeWays.has(w)) continue;
+    const nm = R.names[R.wayName[w]];
+    if (nm && explore.excludeNames.has(nm)) continue;
+    const L = R.wayLen[w], open = L - wayDriven[w];
+    if (L < 40 || open < Math.min(150, L * 0.8)) continue;
+    const s = R.chunkSeg0[c];
+    const d2 = (R.SAX[s] - x) ** 2 + (R.SAY[s] - y) ** 2;
+    if (d2 < bd) { bd = d2; best = c; }
+  }
+  if (best < 0) return null;
+  const w = R.chunkWay[best];
+  return { c: best, w, dist: Math.sqrt(bd), open: R.wayLen[w] - wayDriven[w] };
+}
+
+async function startExplore(next) {
+  if (!R) return;
+  if (!next) {
+    explore = { excludeWays: new Set(), excludeNames: new Set(), origin: null };
+    toast('Suche unerkundete Strasse …', 2000);
+    const pos = await getPosition();
+    explore.origin = pos || [map.getCenter().lng, map.getCenter().lat];
+    if (!pos) toast('Kein Standort – verwende Kartenmitte', 2500);
+  }
+  const t = findTarget(explore.origin[0], explore.origin[1]);
+  if (!t) { toast('Keine unerkundete Strasse gefunden 🎉'); return; }
+  explore.excludeWays.add(t.w);
+  const name = R.names[R.wayName[t.w]];
+  if (name) explore.excludeNames.add(name);
+
+  // ganze Strasse (alle Stücke des Wegs) hervorheben
+  const c0 = R.wayChunk0[t.w], c1 = R.wayChunk0[t.w + 1];
+  const line = chunkLine(c0, c1, false);
+  const s0 = R.chunkSeg0[t.c], s1 = R.chunkSeg0[t.c + 1];
+  const sm = (s0 + s1) >> 1;
+  const dLat = uy(R.SAY[sm]), dLon = ux(R.SAX[sm]);
+  map.getSource('target').setData({ type: 'FeatureCollection', features: [line,
+    { type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: [dLon, dLat] } }] });
+
+  const b = new maplibregl.LngLatBounds(explore.origin, explore.origin);
+  for (const p of line.geometry.coordinates) b.extend(p);
+  map.fitBounds(b, { padding: { top: 140, bottom: 240, left: 50, right: 50 }, maxZoom: 16, duration: 900 });
+
+  $('exKicker').textContent = `Unerkundet · ${CLASS_LABEL[R.wayClass[t.w]]}`;
+  $('exTitle').textContent = name || 'Strasse ohne Namen';
+  $('exSub').textContent = `${km(t.dist)} km Luftlinie · ${nf0.format(t.open)} m neu`;
+  $('exNav').href = navUrl(dLat, dLon);
+  $('exploreCard').classList.remove('hidden');
+}
+
+function closeExplore() {
+  $('exploreCard').classList.add('hidden');
+  if (mapReady) map.getSource('target').setData(empty());
+}
+
+// ───────────────────────── HUD & Statistik ─────────────────────────
+function renderHud() {
+  const st = coverageStats();
+  $('hudPct').textContent = `${pct(st.driven, R.totalLen)} %`;
+  $('hudBar').style.width = `${Math.min(100, 100 * st.driven / R.totalLen)}%`;
+  const syncTxt = cfg.url ? (lastSync ? ` · Sync ${ago(lastSync)}` : ' · nicht synchronisiert') : ' · Empfänger nicht eingerichtet';
+  $('hudSub').textContent = `${km(st.driven)} von ${km(R.totalLen)} km · +${km(st.drivenWeek)} km diese Woche${syncTxt}`;
+  return st;
+}
+
+function renderStats() {
+  const st = coverageStats();
+  const trips = computeTrips();
+  let dist = 0, moving = 0, top = 0, longest = 0, car = 0, moto = 0;
+  for (const tr of trips) {
+    dist += tr.dist; moving += tr.moving; top = Math.max(top, tr.top); longest = Math.max(longest, tr.dist);
+    if (tags[tr.start] === 'moto') moto += tr.dist; else car += tr.dist;
+  }
+  const tile = (v, unit, l, cls = '') => `<div class="tile ${cls}"><div class="v">${v}${unit ? `<small>${unit}</small>` : ''}</div><div class="l">${l}</div></div>`;
+  let h = '<div class="tiles">';
+  h += tile(`${pct(st.driven, R.totalLen)}`, '%', `vom Kanton Zürich erkundet · ${km(st.driven)} von ${km(R.totalLen)} km`, 'big');
+  h += tile(`+${km(st.drivenWeek)}`, 'km', 'neue Strassen (7 Tage)');
+  h += tile(`+${km(st.drivenMonth)}`, 'km', 'neue Strassen (30 Tage)');
+  h += tile(km(dist), 'km', 'insgesamt gefahren');
+  h += tile(nf0.format(trips.length), '', 'Fahrten');
+  h += tile(dur(moving), '', 'Fahrzeit');
+  h += tile(km(longest), 'km', 'längste Fahrt');
+  h += tile(nf0.format(top * 3.6), 'km/h', 'Höchstgeschw. (GPS)');
+  h += tile(dist > 0 ? nf0.format(100 * st.driven / dist) : '0', '%', 'Anteil neue Strecke');
+  h += tile(`🚗 ${km(car)}`, 'km', 'Auto');
+  h += tile(`🏍️ ${km(moto)}`, 'km', 'Motorrad');
+  h += '</div>';
+
+  h += '<h3>Nach Strassentyp</h3>';
+  for (const [label, cls] of GROUPS) {
+    let tot = 0, drv = 0;
+    for (const c of cls) { tot += R.classLen[c]; drv += st.classDriven[c]; }
+    h += `<div class="cls"><div class="cls-top"><span>${label}</span><span>${pct(drv, tot)} % · ${km(drv)}/${km(tot)} km</span></div>
+      <div class="bar"><div class="bar-fill" style="width:${tot ? 100 * drv / tot : 0}%"></div></div></div>`;
+  }
+
+  h += '<h3>Neue Strassen pro Woche (km)</h3><div class="weeks">';
+  const maxW = Math.max(1, ...st.weeks);
+  for (let i = 0; i < 12; i++) {
+    const d = new Date(st.w0 + i * 7 * 864e5);
+    h += `<div class="week"><div class="wv">${st.weeks[i] >= 50 ? nf0.format(st.weeks[i] / 1000) : ''}</div>
+      <div class="col" style="height:${80 * st.weeks[i] / maxW}%"></div><div class="wl">${d.getDate()}.${d.getMonth() + 1}.</div></div>`;
+  }
+  h += '</div>';
+
+  h += '<h3>Fahrten</h3>';
+  if (!trips.length) h += '<div class="empty">Noch keine Fahrten. Richte Overland ein oder importiere GPX-Dateien.</div>';
+  for (const tr of trips.slice().reverse().slice(0, 100)) {
+    const moto = tags[tr.start] === 'moto';
+    h += `<div class="trip"><button class="veh" data-trip="${tr.start}" title="Fahrzeug wechseln">${moto ? '🏍️' : '🚗'}</button>
+      <div class="trip-main"><div class="trip-date">${dateFmt.format(tr.start)}</div>
+      <div class="trip-meta">${timeFmt.format(tr.start)}–${timeFmt.format(tr.end)} · ${km(tr.dist)} km · ${dur(tr.moving)} · max ${nf0.format(tr.top * 3.6)} km/h</div></div>
+      <div class="trip-new">+${km(tr.newLen)} km</div></div>`;
+  }
+  $('statsBody').innerHTML = h;
+}
+
+async function toggleVehicle(start) {
+  const v = tags[start] === 'moto' ? null : 'moto';
+  if (v) tags[start] = v; else delete tags[start];
+  await idb.set('tags', tags);
+  renderStats();
+  if (cfg.url && cfg.token) api('/api/tags', { method: 'PUT', body: JSON.stringify({ start: +start, vehicle: v }) }).catch(() => toast('Fahrzeug konnte nicht synchronisiert werden'));
+}
+
+// ───────────────────────── Sync mit dem Worker ─────────────────────────
+async function api(path, opts = {}) {
+  const base = cfg.url.trim().replace(/\/+$/, '');
+  const r = await fetch(base + path, { ...opts, headers: { Authorization: `Bearer ${cfg.token.trim()}`, 'Content-Type': 'application/json' } });
+  if (!r.ok) throw new Error(r.status === 401 ? 'Token falsch' : `HTTP ${r.status}`);
+  return r.json();
+}
+
+let syncing = false;
+async function sync(manual) {
+  if (!cfg.url || !cfg.token || syncing) return;
+  syncing = true;
+  try {
+    let after = (await idb.get('lastId')) || 0;
+    const got = [];
+    for (;;) {
+      const { points } = await api(`/api/points?after=${after}&limit=5000`);
+      if (!points.length) break;
+      got.push(...points);
+      after = points[points.length - 1][0];
+      if (points.length < 5000) break;
+    }
+    try {
+      const r = await api('/api/tags');
+      tags = r.tags || {};
+      await idb.set('tags', tags);
+    } catch {}
+    lastSync = Date.now();
+    if (got.length) {
+      const b = { t: [], lat: [], lon: [], acc: [], spd: [] };
+      for (const p of got) { b.t.push(p[1]); b.lat.push(p[2]); b.lon.push(p[3]); b.acc.push(p[4]); b.spd.push(p[5]); }
+      await idb.addBatch(b);
+      await idb.set('lastId', after);
+      await ingest(b);
+    } else if (manual) toast('Keine neuen Punkte');
+    renderHud();
+  } catch (e) {
+    if (manual) toast(`Sync fehlgeschlagen: ${e.message}`);
+    $('cfgStatus').innerHTML = `<span class="err">Sync fehlgeschlagen: ${esc(e.message)}</span>`;
+  } finally { syncing = false; }
+}
+
+async function ingest(b) {
+  batches.push(b);
+  P = buildPoints(batches);
+  let minT = Infinity;
+  for (const t of b.t) if (t < minT) minT = t;
+  const newly = processFrom(minT - 60e3);
+  await saveCoverage();
+  renderDriven(); renderHud();
+  if (!$('panel-stats').classList.contains('hidden')) renderStats();
+  renderDataInfo();
+  if (newly >= 20) toast(`+${km(newly)} km neue Strassen erkundet!`, 5000);
+  return newly;
+}
+
+// ───────────────────────── GPX-Import ─────────────────────────
+async function importGpx(files) {
+  let total = 0;
+  for (const f of files) {
+    const xml = new DOMParser().parseFromString(await f.text(), 'application/xml');
+    const b = { t: [], lat: [], lon: [], acc: [], spd: [] };
+    for (const pt of xml.querySelectorAll('trkpt, rtept')) {
+      const timeEl = [...pt.children].find(c => c.localName === 'time');
+      const t = timeEl ? Date.parse(timeEl.textContent.trim()) : NaN;
+      const lat = parseFloat(pt.getAttribute('lat')), lon = parseFloat(pt.getAttribute('lon'));
+      if (!Number.isFinite(t) || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      const spEl = pt.getElementsByTagNameNS('*', 'speed')[0];
+      const sp = spEl ? parseFloat(spEl.textContent) : NaN;
+      b.t.push(t); b.lat.push(lat); b.lon.push(lon); b.acc.push(null); b.spd.push(Number.isFinite(sp) ? sp : null);
+    }
+    if (!b.t.length) { toast(`${f.name}: keine Punkte mit Zeitstempel`); continue; }
+    total += b.t.length;
+    await idb.addBatch(b);
+    await ingest(b);
+    if (cfg.url && cfg.token) uploadBatch(b).catch(() => toast('GPX nur lokal gespeichert (Upload fehlgeschlagen)'));
+  }
+  if (total) toast(`${nf0.format(total)} Punkte importiert`);
+}
+
+async function uploadBatch(b) {
+  for (let i = 0; i < b.t.length; i += 1000) {
+    const locations = [];
+    for (let k = i; k < Math.min(b.t.length, i + 1000); k++) {
+      locations.push({ type: 'Feature', geometry: { type: 'Point', coordinates: [b.lon[k], b.lat[k]] },
+        properties: { timestamp: new Date(b.t[k]).toISOString(), speed: b.spd[k] ?? -1, horizontal_accuracy: b.acc[k] ?? -1 } });
+    }
+    await api('/api/overland', { method: 'POST', body: JSON.stringify({ locations }) });
+  }
+}
+
+// ───────────────────────── Einstellungen ─────────────────────────
+function overlandUrl() {
+  if (!cfg.url || !cfg.token) return '';
+  return `${cfg.url.trim().replace(/\/+$/, '')}/api/overland?token=${encodeURIComponent(cfg.token.trim())}`;
+}
+function fillSettings() {
+  $('cfgUrl').value = cfg.url; $('cfgToken').value = cfg.token;
+  $('overlandUrl').value = overlandUrl() || '(zuerst Worker-URL und Token speichern)';
+  $('optGmApp').checked = cfg.gmApp; $('optMotorway').checked = cfg.motorway; $('optNetwork').checked = cfg.network;
+  renderDataInfo();
+}
+function renderDataInfo() {
+  const last = P.n ? `, letzter ${new Date(P.t[P.n - 1]).toLocaleString('de-CH')}` : '';
+  $('dataInfo').textContent = `${nf0.format(P.n)} GPS-Punkte gespeichert${last}. Strassendaten vom ${R ? new Date(R.version).toLocaleDateString('de-CH') : '–'}.`;
+}
+function randomToken() {
+  const a = new Uint8Array(24); crypto.getRandomValues(a);
+  return Array.from(a, x => 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'[x % 56]).join('');
+}
+
+function bindUi() {
+  document.querySelectorAll('[data-panel]').forEach(b => b.addEventListener('click', () => {
+    const id = b.dataset.panel;
+    closeExplore();
+    if (id === 'stats') renderStats();
+    if (id === 'settings') fillSettings();
+    $(`panel-${id}`).classList.remove('hidden');
+  }));
+  document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => b.closest('.sheet').classList.add('hidden')));
+  $('exploreBtn').addEventListener('click', () => startExplore(false));
+  $('exNext').addEventListener('click', () => startExplore(true));
+  $('exClose').addEventListener('click', closeExplore);
+  $('locateBtn').addEventListener('click', () => geo && geo.trigger());
+  $('statsBody').addEventListener('click', e => { const b = e.target.closest('[data-trip]'); if (b) toggleVehicle(b.dataset.trip); });
+
+  $('genToken').addEventListener('click', () => { $('cfgToken').value = randomToken(); });
+  $('saveCfg').addEventListener('click', async () => {
+    cfg.url = $('cfgUrl').value.trim(); cfg.token = $('cfgToken').value.trim(); saveCfg();
+    $('overlandUrl').value = overlandUrl();
+    $('cfgStatus').textContent = 'Teste Verbindung …';
+    try {
+      const r = await api('/api/ping');
+      $('cfgStatus').innerHTML = `<span class="ok">✓ Verbunden – ${nf0.format(r.count)} Punkte auf dem Server.</span>`;
+      sync(true);
+    } catch (e) { $('cfgStatus').innerHTML = `<span class="err">✗ ${esc(e.message)}</span>`; }
+  });
+  $('syncNow').addEventListener('click', () => sync(true));
+  $('copyOverland').addEventListener('click', async () => {
+    const u = overlandUrl(); if (!u) return;
+    try { await navigator.clipboard.writeText(u); toast('Kopiert'); } catch { $('overlandUrl').select(); }
+  });
+  $('optGmApp').addEventListener('change', e => { cfg.gmApp = e.target.checked; saveCfg(); });
+  $('optMotorway').addEventListener('change', e => { cfg.motorway = e.target.checked; saveCfg(); });
+  $('optNetwork').addEventListener('change', e => {
+    cfg.network = e.target.checked; saveCfg();
+    if (mapReady) map.setLayoutProperty('network', 'visibility', cfg.network ? 'visible' : 'none');
+  });
+  $('gpxInput').addEventListener('change', async e => { const f = [...e.target.files]; e.target.value = ''; if (f.length) await importGpx(f); });
+  $('recompute').addEventListener('click', async () => {
+    setLoading('Berechne neu …'); await tick();
+    CF = new Float64Array(R.C); processFrom(-Infinity); await saveCoverage();
+    renderDriven(); renderHud(); setLoading(null); toast('Neu berechnet');
+  });
+  $('wipe').addEventListener('click', async () => {
+    if (!confirm('Alle lokal gespeicherten GPS-Punkte löschen? (Daten auf dem Server bleiben erhalten und werden beim nächsten Sync neu geladen.)')) return;
+    await idb.clear(); location.reload();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && Date.now() - lastSync > 60e3) sync(false);
+  });
+}
+
+// ───────────────────────── Start ─────────────────────────
+async function main() {
+  bindUi();
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  await idb.open();
+  const mapP = initMap();
+
+  setLoading('Strassennetz wird geladen …');
+  try {
+    const r = await fetch(ROADS_URL, { cache: 'no-cache' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    ROADS = await r.json();
+  } catch (e) {
+    setLoading(`Strassendaten konnten nicht geladen werden (${e.message}). Bitte später erneut öffnen.`);
+    return;
+  }
+  setLoading('Strassennetz wird aufbereitet …'); await tick();
+  R = buildRoads(ROADS);
+  ROADS = null;
+
+  setLoading('Fahrten werden geladen …'); await tick();
+  batches = await idb.allBatches();
+  P = buildPoints(batches);
+  tags = (await idb.get('tags')) || {};
+
+  const cov = await idb.get('coverage');
+  if (cov && cov.version === R.version && cov.n === P.n && cov.cf && cov.cf.byteLength === R.C * 8) {
+    CF = new Float64Array(cov.cf);
+  } else {
+    setLoading('Erkundete Strassen werden berechnet …'); await tick();
+    CF = new Float64Array(R.C);
+    processFrom(-Infinity);
+    await saveCoverage();
+  }
+
+  await mapP;
+  renderNetwork(); renderDriven(); renderHud();
+  setLoading(null);
+  if (!cfg.url) toast('Tipp: Empfänger unter ⚙ Einstellungen einrichten', 5000);
+  sync(false);
+  setInterval(() => { if (document.visibilityState === 'visible') { renderHud(); if (Date.now() - lastSync > 5 * 60e3) sync(false); } }, 60e3);
+}
+
+// Für Tests
+window.__erkunder = { get R() { return R; }, get CF() { return CF; }, get P() { return P; }, computeTrips, coverageStats, findTarget, importGpx };
+
+main();
+})();

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Strassenjäger</title>
+<meta name="theme-color" content="#0b0e14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Strassenjäger">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="map"></div>
+
+<div id="hud">
+  <div class="hud-top">
+    <span class="hud-pct" id="hudPct">–</span>
+    <span class="hud-label">Kanton Zürich erkundet</span>
+  </div>
+  <div class="bar"><div class="bar-fill" id="hudBar"></div></div>
+  <div class="hud-sub" id="hudSub">Lade …</div>
+</div>
+
+<button id="locateBtn" class="fab-small" aria-label="Mein Standort">◎</button>
+
+<div id="exploreCard" class="card hidden">
+  <div class="card-head">
+    <div>
+      <div class="card-kicker" id="exKicker">Unerkundet</div>
+      <div class="card-title" id="exTitle">–</div>
+      <div class="card-sub" id="exSub"></div>
+    </div>
+    <button class="icon-btn" id="exClose" aria-label="Schliessen">✕</button>
+  </div>
+  <div class="card-actions">
+    <a class="btn primary" id="exNav" href="#" target="_blank" rel="noopener">Navigieren mit Google Maps</a>
+    <button class="btn" id="exNext">Nächste</button>
+  </div>
+</div>
+
+<nav id="dock">
+  <button class="dock-btn" data-panel="stats"><span>▤</span>Statistik</button>
+  <button class="dock-btn explore" id="exploreBtn"><span>✦</span>Erkunden</button>
+  <button class="dock-btn" data-panel="settings"><span>⚙</span>Einstellungen</button>
+</nav>
+
+<section id="panel-stats" class="sheet hidden">
+  <div class="sheet-head"><h2>Statistik</h2><button class="icon-btn" data-close>✕</button></div>
+  <div class="sheet-body" id="statsBody"></div>
+</section>
+
+<section id="panel-settings" class="sheet hidden">
+  <div class="sheet-head"><h2>Einstellungen</h2><button class="icon-btn" data-close>✕</button></div>
+  <div class="sheet-body">
+    <h3>Empfänger (Cloudflare Worker)</h3>
+    <label>Worker-URL<input id="cfgUrl" type="url" placeholder="https://strassenjaeger.DEINNAME.workers.dev" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+    <label>Token<div class="row"><input id="cfgToken" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"><button class="btn" id="genToken">Neu</button></div></label>
+    <div class="row">
+      <button class="btn primary" id="saveCfg">Speichern &amp; testen</button>
+      <button class="btn" id="syncNow">Jetzt synchronisieren</button>
+    </div>
+    <p class="hint" id="cfgStatus"></p>
+
+    <h3>Adresse für Overland</h3>
+    <p class="hint">In Overland unter <b>Settings → Receiver Endpoint</b> eintragen:</p>
+    <div class="row"><input id="overlandUrl" type="text" readonly><button class="btn" id="copyOverland">Kopieren</button></div>
+
+    <h3>Optionen</h3>
+    <label class="check"><input type="checkbox" id="optGmApp"> Google-Maps-App direkt öffnen</label>
+    <label class="check"><input type="checkbox" id="optMotorway"> Autobahnen bei „Erkunden“ vorschlagen</label>
+    <label class="check"><input type="checkbox" id="optNetwork"> Unerkundete Strassen anzeigen</label>
+
+    <h3>Daten</h3>
+    <label class="btn file">GPX-Dateien importieren<input type="file" id="gpxInput" accept=".gpx,application/gpx+xml" multiple hidden></label>
+    <div class="row">
+      <button class="btn" id="recompute">Neu berechnen</button>
+      <button class="btn danger" id="wipe">Lokale Daten löschen</button>
+    </div>
+    <p class="hint" id="dataInfo"></p>
+    <p class="hint small">Kartendaten © OpenStreetMap-Mitwirkende · Kartenstil OpenFreeMap</p>
+  </div>
+</section>
+
+<div id="toast" class="hidden"></div>
+<div id="loading"><div class="spinner"></div><div id="loadingText">Strassennetz wird geladen …</div></div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
