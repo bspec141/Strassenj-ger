@@ -15,7 +15,7 @@ Alles kostenlos: GitHub Pages, Cloudflare (Gratis-Tarif, keine Kreditkarte), Ope
 1. Repository → **Settings → Pages → Source: „GitHub Actions“**.
 2. Tab **Actions** → „Bauen & veröffentlichen“ → **Run workflow** (oder einfach pushen).
    Lädt das Strassennetz aus OpenStreetMap (dauert ein paar Minuten) und veröffentlicht die App.
-3. App öffnen: `https://bspec141.github.io/strassenj-ger/`
+3. App öffnen: `https://bspec141.github.io/Strassenj-ger/`
 4. In Safari: **Teilen → Zum Home-Bildschirm**.
 
 Die Strassendaten werden monatlich automatisch aktualisiert.
