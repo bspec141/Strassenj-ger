@@ -78,7 +78,14 @@ export function convert(osm, generated = new Date().toISOString()) {
     let n = nameIdx.get(name);
     if (n === undefined) { n = names.length; names.push(name); nameIdx.set(name, n); }
 
-    const row = [c, n];
+    // Einbahn: 0 = beide Richtungen, 1 = nur in Zeichenrichtung, 2 = nur entgegen
+    const ow = el.tags.oneway;
+    let one = 0;
+    if (ow === 'yes' || ow === 'true' || ow === '1') one = 1;
+    else if (ow === '-1' || ow === 'reverse') one = 2;
+    else if (ow !== 'no' && (el.tags.highway === 'motorway' || el.tags.highway === 'motorway_link'
+      || el.tags.junction === 'roundabout' || el.tags.junction === 'circular')) one = 1;
+    const row = [c | (one << 4), n];
     let px = 0, py = 0, prev = null;
     for (const g of el.geometry) {
       if (!g) continue; // Overpass liefert null für Knoten ausserhalb
@@ -90,7 +97,7 @@ export function convert(osm, generated = new Date().toISOString()) {
     }
     if (row.length >= 6) ways.push(row);
   }
-  return { v: 1, generated, region: REGION, attribution: '© OpenStreetMap-Mitwirkende (ODbL)',
+  return { v: 2, generated, region: REGION, attribution: '© OpenStreetMap-Mitwirkende (ODbL)',
     classes: CLASSES, totalKm: Math.round(totalM / 100) / 10, names, ways };
 }
 

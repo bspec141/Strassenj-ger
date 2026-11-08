@@ -52,10 +52,35 @@
   </div>
 </div>
 
+<div id="routeCard" class="card hidden">
+  <div class="card-head">
+    <div><div class="card-kicker">Route planen</div><div class="card-title">Erkundungstour</div></div>
+    <button class="icon-btn" id="rtClose" aria-label="Schliessen">✕</button>
+  </div>
+  <div class="seg" id="rtMode"><button data-mode="time">Nach Zeit</button><button data-mode="radius">Nach Umkreis</button></div>
+  <div class="chips" id="rtChips"></div>
+  <label class="check"><input type="checkbox" id="rtBack" checked> Zurück zum Startpunkt</label>
+  <div class="card-actions"><button class="btn primary" id="rtGo">Route berechnen</button></div>
+</div>
+
+<div id="routeResult" class="card hidden">
+  <div class="card-head">
+    <div><div class="card-kicker">Erkundungstour</div><div class="card-title" id="rtTitle">–</div><div class="card-sub" id="rtSub"></div></div>
+    <button class="icon-btn" id="rtDiscard" aria-label="Route verwerfen">✕</button>
+  </div>
+  <div class="card-actions">
+    <button class="btn" id="rtLegPrev" aria-label="Vorherige Etappe">‹</button>
+    <a class="btn primary" id="rtNav" href="#" target="_blank" rel="noopener">Navigieren mit Google Maps</a>
+    <button class="btn" id="rtLegNext" aria-label="Nächste Etappe">›</button>
+  </div>
+  <div class="card-actions"><button class="btn" id="rtDrive" style="flex:1">▶ Im Fahrmodus folgen</button></div>
+</div>
+
 <nav id="dock">
   <button class="dock-btn" data-panel="stats"><span>▤</span>Statistik</button>
   <button class="dock-btn explore" id="exploreBtn"><span>✦</span>Erkunden</button>
-  <button class="dock-btn" data-panel="settings"><span>⚙</span>Einstellungen</button>
+  <button class="dock-btn" id="routeBtn"><span>⤳</span>Route</button>
+  <button class="dock-btn" data-panel="settings"><span>⚙</span>Optionen</button>
 </nav>
 
 <section id="panel-stats" class="sheet hidden">
@@ -64,7 +89,7 @@
 </section>
 
 <section id="panel-settings" class="sheet hidden">
-  <div class="sheet-head"><h2>Einstellungen</h2><button class="icon-btn" data-close>✕</button></div>
+  <div class="sheet-head"><h2>Optionen</h2><button class="icon-btn" data-close>✕</button></div>
   <div class="sheet-body">
     <h3>Empfänger (Cloudflare Worker)</h3>
     <label>Worker-URL<input id="cfgUrl" type="url" placeholder="https://strassenjaeger.DEINNAME.workers.dev" autocomplete="off" autocapitalize="off" spellcheck="false"></label>

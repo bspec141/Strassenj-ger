@@ -26,13 +26,13 @@ Die Strassendaten werden monatlich automatisch aktualisiert.
 3. **Workers & Pages → Create → Worker** („Hello World“) → Name `strassenjaeger` → **Deploy**.
 4. **Edit code** → Inhalt von [`worker/worker.js`](worker/worker.js) komplett einfügen → **Deploy**.
 5. Worker → **Settings → Bindings → Add → D1 database** → Variablenname `DB`, Datenbank `strassenjaeger`.
-6. In der Web-App unter ⚙ Einstellungen bei „Token“ auf **Neu** tippen und den Token kopieren.
+6. In der Web-App unter ⚙ Optionen bei „Token“ auf **Neu** tippen und den Token kopieren.
 7. Worker → **Settings → Variables and Secrets → Add** → Typ *Secret*, Name `TOKEN`, Wert = dein Token.
 8. In der Web-App die Worker-URL (`https://strassenjaeger.DEINNAME.workers.dev`) eintragen → **Speichern & testen**.
 
 ### 3. Overland (GPS-Aufzeichnung)
 1. **Overland GPS Tracker** aus dem App Store installieren (gratis).
-2. Die „Adresse für Overland“ aus den Einstellungen der Web-App kopieren und in Overland als
+2. Die „Adresse für Overland“ aus den Optionen der Web-App kopieren und in Overland als
    **Receiver Endpoint** eintragen.
 3. Standortzugriff **„Immer“** erlauben, Tracking einschalten.
 4. Empfohlen: Desired Accuracy *Best/10 m*, Activity Type *Automotive*,
@@ -43,6 +43,8 @@ Fertig: Overland schickt die Punkte automatisch, die Web-App holt sie beim Öffn
 ## Funktionen
 - Erkundete Strassen leuchten (cyan, die letzten 7 Tage orange), unerkundete grau
 - **Erkunden**: schlägt die nächste unerkundete Strasse vor → „Navigieren mit Google Maps“
+- **Route planen**: Tour durch unerkundete Strassen nach Zeit (15 Min–2 h) oder Umkreis, optional zurück
+  zum Start; beachtet Einbahnstrassen; Navigation in Etappen à 9 Stopps über Google Maps oder im Fahrmodus
 - **Fahrmodus**: Bildschirm bleibt an, Karte folgt dir, Strassen leuchten live auf, Tempo + neue km
 - Antippen einer beliebigen Strasse: Status + „Hierhin navigieren“
 - Statistik: % des Kantons, neue km pro Woche, nach Strassentyp, Fahrten, Fahrzeit,

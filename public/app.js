@@ -149,7 +149,9 @@ function buildPoints(list) {
 // ───────────────────────── Strassennetz ─────────────────────────
 function buildRoads(data) {
   const W = data.ways.length;
-  const wayClass = new Uint8Array(W), wayName = new Uint32Array(W), wayLen = new Float32Array(W);
+  const wayClass = new Uint8Array(W), wayOne = new Uint8Array(W), wayName = new Uint32Array(W), wayLen = new Float32Array(W);
+  const wayVert0 = new Uint32Array(W + 1);
+  const vKey = [], vX = [], vY = [], vSeg = [];
   const wayChunk0 = new Uint32Array(W + 1);
   const lines = new Array(W);
   const sax = [], say = [], sbx = [], sby = [], segChunk = [];
@@ -158,7 +160,9 @@ function buildRoads(data) {
 
   for (let w = 0; w < W; w++) {
     const row = data.ways[w];
-    wayClass[w] = row[0]; wayName[w] = row[1];
+    const cls = row[0] & 15;
+    wayClass[w] = cls; wayOne[w] = row[0] >> 4; wayName[w] = row[1];
+    wayVert0[w] = vKey.length;
     wayChunk0[w] = chunkWay.length;
     const coords = [], X = [], Y = [];
     let ix = 0, iy = 0;
@@ -166,11 +170,14 @@ function buildRoads(data) {
       ix += row[i]; iy += row[i + 1];
       const lon = ix / 1e5, lat = iy / 1e5;
       coords.push([lon, lat]); X.push(px(lon)); Y.push(py(lat));
+      vKey.push(ix * 1e7 + iy);
     }
     lines[w] = coords;
 
     let acc = 0, total = 0, startSeg = sax.length;
+    for (let i = 0; i < X.length; i++) { vX.push(X[i]); vY.push(Y[i]); }
     for (let i = 1; i < X.length; i++) {
+      vSeg.push(sax.length);
       const ax = X[i - 1], ay = Y[i - 1], dx = X[i] - ax, dy = Y[i] - ay;
       const L = Math.hypot(dx, dy);
       if (L === 0) continue;
@@ -196,10 +203,12 @@ function buildRoads(data) {
         chunkWay.push(w); chunkLen.push(acc); chunkSeg0.push(startSeg);
       }
     }
+    vSeg.push(sax.length);
     wayLen[w] = total;
-    classLen[row[0]] += total;
+    classLen[cls] += total;
   }
   wayChunk0[W] = chunkWay.length;
+  wayVert0[W] = vKey.length;
   chunkSeg0.push(sax.length);
 
   const S = sax.length;
@@ -219,7 +228,8 @@ function buildRoads(data) {
   for (const l of classLen) totalLen += l;
 
   return {
-    W, C: chunkWay.length, S, wayClass, wayName, wayLen, wayChunk0, lines, names: data.names,
+    W, C: chunkWay.length, S, wayClass, wayOne, wayName, wayVert0,
+    vKey: Float64Array.from(vKey), vX: Float32Array.from(vX), vY: Float32Array.from(vY), vSeg: Uint32Array.from(vSeg), wayLen, wayChunk0, lines, names: data.names,
     SAX, SAY, SBX, SBY, segChunk: Uint32Array.from(segChunk),
     chunkWay: Uint32Array.from(chunkWay), chunkLen: Float32Array.from(chunkLen), chunkSeg0: Uint32Array.from(chunkSeg0),
     grid, classLen, totalLen, version: data.generated,
@@ -402,6 +412,13 @@ async function initMap() {
   map.addLayer({ id: 'target-pt', type: 'circle', source: 'target', filter: ['==', ['geometry-type'], 'Point'],
     paint: { 'circle-radius': 9, 'circle-color': '#ff3df2', 'circle-stroke-color': '#fff', 'circle-stroke-width': 2.5 } });
 
+  map.addSource('route', { type: 'geojson', data: empty() });
+  map.addLayer({ id: 'route-casing', type: 'line', source: 'route', filter: ['==', ['geometry-type'], 'LineString'],
+    layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': '#2a0a2a', 'line-width': w(4, 6, 10, 18), 'line-opacity': 0.8 } });
+  map.addLayer({ id: 'route', type: 'line', source: 'route', filter: ['==', ['geometry-type'], 'LineString'],
+    layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': '#ff3df2', 'line-width': w(2, 3.5, 6, 11) } });
+  map.addLayer({ id: 'route-stops', type: 'circle', source: 'route', filter: ['==', ['geometry-type'], 'Point'],
+    paint: { 'circle-radius': 6, 'circle-color': '#fff', 'circle-stroke-color': '#ff3df2', 'circle-stroke-width': 3 } });
   map.addSource('me', { type: 'geojson', data: empty() });
   map.addLayer({ id: 'me-halo', type: 'circle', source: 'me', paint: { 'circle-radius': 18, 'circle-color': '#3d8bff', 'circle-opacity': 0.2 } });
   map.addLayer({ id: 'me', type: 'circle', source: 'me', paint: { 'circle-radius': 8, 'circle-color': '#3d8bff', 'circle-stroke-color': '#fff', 'circle-stroke-width': 3 } });
@@ -543,6 +560,320 @@ function closeExplore() {
   if (mapReady) map.getSource('target').setData(empty());
 }
 
+// ───────────────────────── Routenplanung ─────────────────────────
+// Geschätzte Fahrgeschwindigkeit je Strassenklasse (m/s) – bewusst eher vorsichtig
+const SPEED = [25, 20, 13, 12.5, 11.5, 9.5, 8, 4.5];
+const EDGE_PENALTY = 4;    // s je Kante (Kreuzungen, Abbiegen)
+const MIN_NEW = 40;        // m – kürzere unerkundete Reste lohnen keinen Umweg
+const STOPS_PER_LEG = 9;   // Google Maps: max. ~9 Stopps pro Route
+let G = null;
+let route = null;          // aktuelle Route
+let routeUi = { mode: 'time', minutes: 45, radius: 3 };
+
+function buildGraph() {
+  const { W, wayVert0, vKey, vX, vY, vSeg } = R;
+  const deg = new Map();
+  for (let w = 0; w < W; w++) {
+    const a = wayVert0[w], b = wayVert0[w + 1];
+    for (let i = a; i < b; i++) deg.set(vKey[i], (deg.get(vKey[i]) || 0) + (i === a || i === b - 1 ? 2 : 1));
+  }
+  const nodeId = new Map(), nX = [], nY = [];
+  const node = i => {
+    let id = nodeId.get(vKey[i]);
+    if (id === undefined) { id = nX.length; nodeId.set(vKey[i], id); nX.push(vX[i]); nY.push(vY[i]); }
+    return id;
+  };
+  const eU = [], eV = [], eW = [], eS0 = [], eS1 = [], eLen = [], eCost = [], eDir = [], eC0 = [], eC1 = [];
+  for (let w = 0; w < W; w++) {
+    const a = wayVert0[w], b = wayVert0[w + 1];
+    let start = a;
+    for (let i = a + 1; i < b; i++) {
+      if (i !== b - 1 && deg.get(vKey[i]) < 2) continue;
+      const s0 = vSeg[start], s1 = vSeg[i];
+      if (s1 > s0) {
+        let len = 0;
+        for (let s = s0; s < s1; s++) len += Math.hypot(R.SBX[s] - R.SAX[s], R.SBY[s] - R.SAY[s]);
+        eU.push(node(start)); eV.push(node(i)); eW.push(w); eS0.push(s0); eS1.push(s1); eLen.push(len);
+        eCost.push(len / SPEED[R.wayClass[w]] + EDGE_PENALTY); eDir.push(R.wayOne[w]);
+        eC0.push(R.segChunk[s0]); eC1.push(R.segChunk[s1 - 1]);
+      }
+      start = i;
+    }
+  }
+  const N = nX.length, E = eU.length;
+  // Gerichtete Kanten (Arcs) als CSR, vorwärts und rückwärts
+  const fwdCnt = new Uint32Array(N + 1), revCnt = new Uint32Array(N + 1);
+  const arcs = []; // [from, to, edge, rev]
+  for (let e = 0; e < E; e++) {
+    if (eDir[e] !== 2) arcs.push(eU[e], eV[e], e, 0);
+    if (eDir[e] !== 1) arcs.push(eV[e], eU[e], e, 1);
+  }
+  const A = arcs.length / 4;
+  for (let k = 0; k < A; k++) { fwdCnt[arcs[4 * k] + 1]++; revCnt[arcs[4 * k + 1] + 1]++; }
+  for (let n = 0; n < N; n++) { fwdCnt[n + 1] += fwdCnt[n]; revCnt[n + 1] += revCnt[n]; }
+  const mk = cnt => ({ start: cnt, to: new Uint32Array(A), edge: new Uint32Array(A), rev: new Uint8Array(A) });
+  const fwd = mk(fwdCnt), bwd = mk(revCnt);
+  const fp = fwdCnt.slice(0, N), bp = revCnt.slice(0, N);
+  for (let k = 0; k < A; k++) {
+    const f = arcs[4 * k], t = arcs[4 * k + 1], e = arcs[4 * k + 2], r = arcs[4 * k + 3];
+    let i = fp[f]++; fwd.to[i] = t; fwd.edge[i] = e; fwd.rev[i] = r;
+    i = bp[t]++; bwd.to[i] = f; bwd.edge[i] = e; bwd.rev[i] = r;
+  }
+  const segLen = new Float32Array(R.S);
+  for (let k = 0; k < R.S; k++) segLen[k] = Math.hypot(R.SBX[k] - R.SAX[k], R.SBY[k] - R.SAY[k]);
+  return {
+    segLen, N, E, nX: Float32Array.from(nX), nY: Float32Array.from(nY), fwd, bwd,
+    eU: Uint32Array.from(eU), eV: Uint32Array.from(eV), eW: Uint32Array.from(eW), eS0: Uint32Array.from(eS0), eS1: Uint32Array.from(eS1),
+    eLen: Float32Array.from(eLen), eCost: Float32Array.from(eCost), eDir: Uint8Array.from(eDir),
+    eC0: Uint32Array.from(eC0), eC1: Uint32Array.from(eC1),
+    dist: new Float64Array(N), stamp: new Uint32Array(N), gen: 0,
+    prevNode: new Int32Array(N), prevEdge: new Int32Array(N), prevRev: new Uint8Array(N),
+  };
+}
+
+// Binärer Min-Heap (Kosten, Knoten)
+class Heap {
+  constructor() { this.c = []; this.n = []; }
+  get size() { return this.c.length; }
+  push(cost, node) {
+    const c = this.c, n = this.n; let i = c.length; c.push(cost); n.push(node);
+    while (i > 0) { const p = (i - 1) >> 1; if (c[p] <= cost) break; c[i] = c[p]; n[i] = n[p]; i = p; }
+    c[i] = cost; n[i] = node;
+  }
+  pop() {
+    const c = this.c, n = this.n, top = n[0], lc = c.pop(), ln = n.pop(), len = c.length;
+    if (len) {
+      let i = 0;
+      for (;;) { let k = 2 * i + 1; if (k >= len) break; if (k + 1 < len && c[k + 1] < c[k]) k++; if (c[k] >= lc) break; c[i] = c[k]; n[i] = n[k]; i = k; }
+      c[i] = lc; n[i] = ln;
+    }
+    return top;
+  }
+  peekCost() { return this.c[0]; }
+}
+
+// Dijkstra; visit(node, dist) → true = abbrechen
+function dijkstra(src, adj, limit, visit) {
+  const g = G, gen = ++g.gen, dist = g.dist, stamp = g.stamp;
+  const D = n => stamp[n] === gen ? dist[n] : Infinity;
+  const h = new Heap();
+  stamp[src] = gen; dist[src] = 0; g.prevNode[src] = -1; h.push(0, src);
+  while (h.size) {
+    const dc = h.peekCost(), n = h.pop();
+    if (dc > D(n)) continue;
+    if (dc > limit) break;
+    if (visit && visit(n, dc)) break;
+    for (let k = adj.start[n], ke = adj.start[n + 1]; k < ke; k++) {
+      const m = adj.to[k], nd = dc + g.eCost[adj.edge[k]];
+      if (nd < D(m)) {
+        stamp[m] = gen; dist[m] = nd; g.prevNode[m] = n; g.prevEdge[m] = adj.edge[k]; g.prevRev[m] = adj.rev[k];
+        h.push(nd, m);
+      }
+    }
+  }
+  return D;
+}
+
+function tracePath(target) {
+  const steps = [];
+  for (let n = target; G.prevNode[n] >= 0; n = G.prevNode[n]) steps.push({ e: G.prevEdge[n], rev: G.prevRev[n] });
+  return steps.reverse();
+}
+
+async function planRoute(startLonLat, opts) {
+  if (!G) { setLoading('Strassengraph wird aufgebaut …'); await tick(); G = buildGraph(); }
+  setLoading('Route wird berechnet …'); await tick();
+  const T = opts.mode === 'time' ? opts.minutes * 60 : 3 * 3600;
+  const sx = px(startLonLat[0]), sy = py(startLonLat[1]);
+  let sNode = -1, bd = Infinity;
+  for (let n = 0; n < G.N; n++) {
+    const d2 = (G.nX[n] - sx) ** 2 + (G.nY[n] - sy) ** 2;
+    if (d2 < bd && G.fwd.start[n + 1] > G.fwd.start[n]) { bd = d2; sNode = n; }
+  }
+  if (sNode < 0 || bd > 2000 ** 2) return { error: 'Kein Strassennetz in deiner Nähe (nur Kanton Zürich).' };
+
+  // Erlaubte Zielkanten (im Umkreis, ohne Autobahn falls nicht gewünscht)
+  const maxR2 = opts.mode === 'radius' ? (opts.radius * 1000) ** 2 : (T * 9 / 2) ** 2;
+  const allowed = new Uint8Array(G.E);
+  for (let e = 0; e < G.E; e++) {
+    if (!cfg.motorway && R.wayClass[G.eW[e]] <= 1) continue;
+    const s = (G.eS0[e] + G.eS1[e]) >> 1;
+    if ((R.SAX[s] - sx) ** 2 + (R.SAY[s] - sy) ** 2 <= maxR2) allowed[e] = 1;
+  }
+  // metergenau auf Segmentebene: unerkundet und noch nicht eingeplant
+  const planned = new Uint8Array(R.S);
+  let gained = 0;
+  const newLen = e => { let s = 0; for (let k = G.eS0[e]; k < G.eS1[e]; k++) if (!planned[k] && !CF[R.segChunk[k]]) s += G.segLen[k]; return s; };
+  const mark = e => { for (let k = G.eS0[e]; k < G.eS1[e]; k++) if (!planned[k]) { planned[k] = 1; if (!CF[R.segChunk[k]]) gained += G.segLen[k]; } };
+  let maxNew = 0;
+  for (let e = 0; e < G.E; e++) if (allowed[e] && G.eLen[e] > maxNew) maxNew = G.eLen[e];
+
+  // Distanz zurück zum Start (rückwärts-Dijkstra), als Kopie
+  let toStart = null;
+  if (opts.back) {
+    const D = dijkstra(sNode, G.bwd, T);
+    toStart = new Float64Array(G.N);
+    for (let n = 0; n < G.N; n++) toStart[n] = D(n);
+  }
+
+  const steps = [];
+  let cur = sNode, t = 0, iter = 0, lastYield = performance.now();
+  for (; iter < 600; iter++) {
+    let best = -1, bestRev = 0, bestScore = 0, bestFrom = -1, bestTT = 0;
+    const remain = T - t;
+    dijkstra(cur, G.fwd, remain, (n, dn) => {
+      if (bestScore > 0 && bestScore * (dn + 30) >= maxNew) return true; // weiter weg kann nicht besser werden
+      for (let k = G.fwd.start[n], ke = G.fwd.start[n + 1]; k < ke; k++) {
+        const e = G.fwd.edge[k];
+        if (!allowed[e]) continue;
+        const nl = newLen(e);
+        if (nl < MIN_NEW) continue;
+        const tt = dn + G.eCost[e];
+        if (tt > remain) continue;
+        if (toStart && tt + toStart[G.fwd.to[k]] > remain) continue;
+        const score = nl / (tt + 30);
+        if (score > bestScore) { bestScore = score; best = e; bestRev = G.fwd.rev[k]; bestFrom = n; bestTT = tt; }
+      }
+      return false;
+    });
+    if (best < 0) break;
+    // bestFrom wurde von Dijkstra endgültig besucht → Vorgängerkette ist gültig
+    for (const st of tracePath(bestFrom)) { steps.push({ ...st, target: false }); mark(st.e); }
+    steps.push({ e: best, rev: bestRev, target: true }); mark(best);
+    t += bestTT;
+    cur = bestRev ? G.eU[best] : G.eV[best];
+    if (performance.now() - lastYield > 150) { await tick(); lastYield = performance.now(); }
+  }
+  if (opts.back && cur !== sNode) {
+    const D = dijkstra(cur, G.fwd, Infinity, n => n === sNode);
+    if (D(sNode) < Infinity) { for (const st of tracePath(sNode)) { steps.push({ ...st, target: false }); mark(st.e); } t += D(sNode); }
+  }
+  if (!steps.some(s => s.target)) return { error: 'Keine unerkundeten Strassen in Reichweite gefunden.' };
+
+  // Ergebnis aufbereiten
+  const coords = [];
+  let totalLen = 0;
+  for (const st of steps) {
+    const pts = edgeCoords(st.e, st.rev);
+    if (coords.length) pts.shift();
+    coords.push(...pts);
+    totalLen += G.eLen[st.e];
+  }
+  return { coords, steps, time: t, totalLen, gained, stops: routeStops(steps, opts.back ? startLonLat : null), leg: 0 };
+}
+
+function edgeCoords(e, rev) {
+  const s0 = G.eS0[e], s1 = G.eS1[e];
+  const pts = [[ux(R.SAX[s0]), uy(R.SAY[s0])]];
+  for (let s = s0; s < s1; s++) pts.push([ux(R.SBX[s]), uy(R.SBY[s])]);
+  return rev ? pts.reverse() : pts;
+}
+
+// Wegpunkte für Google Maps: je zusammenhängendem Abschnitt neuer Strassen ein Punkt (bei langen alle ~1.2 km)
+function routeStops(steps, backTo) {
+  const stops = [];
+  let run = [];
+  const flush = () => {
+    if (!run.length) return;
+    const pts = [];
+    for (const st of run) { const c = edgeCoords(st.e, st.rev); if (pts.length) c.shift(); pts.push(...c); }
+    let len = 0;
+    for (let i = 1; i < pts.length; i++) len += Math.hypot(px(pts[i][0]) - px(pts[i - 1][0]), py(pts[i][1]) - py(pts[i - 1][1]));
+    const n = Math.max(1, Math.round(len / 1200));
+    for (let k = 0; k < n; k++) {
+      const goal = len * (k + 0.5) / n;
+      let acc = 0;
+      for (let i = 1; i < pts.length; i++) {
+        acc += Math.hypot(px(pts[i][0]) - px(pts[i - 1][0]), py(pts[i][1]) - py(pts[i - 1][1]));
+        if (acc >= goal) { stops.push(pts[i]); break; }
+      }
+    }
+    run = [];
+  };
+  for (const st of steps) { if (st.target) run.push(st); else flush(); }
+  flush();
+  if (backTo) stops.push(backTo);
+  return stops;
+}
+
+function legCount(r) { return Math.max(1, Math.ceil(r.stops.length / STOPS_PER_LEG)); }
+
+function legUrl(r, leg) {
+  const part = r.stops.slice(leg * STOPS_PER_LEG, (leg + 1) * STOPS_PER_LEG);
+  const f = p => `${p[1].toFixed(6)},${p[0].toFixed(6)}`;
+  const dest = part[part.length - 1], via = part.slice(0, -1);
+  if (cfg.gmApp) return `comgooglemaps://?daddr=${[...via, dest].map(f).join('+to:')}&directionsmode=driving`;
+  return `https://www.google.com/maps/dir/?api=1&destination=${f(dest)}${via.length ? `&waypoints=${encodeURIComponent(via.map(f).join('|'))}` : ''}&travelmode=driving`;
+}
+
+// ── UI ──
+function openRoutePanel() {
+  closeExplore();
+  $('routeResult').classList.add('hidden');
+  renderRouteChips();
+  $('routeCard').classList.remove('hidden');
+}
+function renderRouteChips() {
+  document.querySelectorAll('#rtMode button').forEach(b => b.classList.toggle('on', b.dataset.mode === routeUi.mode));
+  const opts = routeUi.mode === 'time' ? [15, 30, 45, 60, 90, 120] : [1, 2, 3, 5, 10];
+  const cur = routeUi.mode === 'time' ? routeUi.minutes : routeUi.radius;
+  $('rtChips').innerHTML = opts.map(v => `<button class="chip${v === cur ? ' on' : ''}" data-v="${v}">${routeUi.mode === 'time' ? (v < 60 ? `${v} Min` : `${v / 60} h`).replace('1.5 h', '1½ h') : `${v} km`}</button>`).join('');
+}
+async function runPlanner() {
+  $('routeCard').classList.add('hidden');
+  const pos = await getPosition();
+  const start = pos || [map.getCenter().lng, map.getCenter().lat];
+  if (!pos) toast('Kein Standort – plane ab Kartenmitte', 2500);
+  let r;
+  try { r = await planRoute(start, { ...routeUi, back: $('rtBack').checked }); }
+  finally { setLoading(null); }
+  if (r.error) { toast(r.error, 4000); $('routeCard').classList.remove('hidden'); return; }
+  route = r;
+  map.getSource('route').setData({ type: 'FeatureCollection', features: [
+    { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: r.coords } },
+    ...r.stops.map((p, i) => ({ type: 'Feature', properties: { n: i + 1 }, geometry: { type: 'Point', coordinates: p } })),
+  ] });
+  const b = new maplibregl.LngLatBounds(start, start);
+  for (const p of r.coords) b.extend(p);
+  map.fitBounds(b, { padding: { top: 140, bottom: 260, left: 40, right: 40 }, duration: 900 });
+  showRouteResult();
+}
+function showRouteResult() {
+  if (!route) return;
+  const legs = legCount(route);
+  $('rtTitle').textContent = `${dur(route.time * 1000)} · ${km(route.totalLen)} km`;
+  $('rtSub').textContent = `${km(route.gained)} km neue Strassen (${nf0.format(100 * route.gained / Math.max(1, route.totalLen))} %) · ${route.stops.length} Stopps`;
+  $('rtNav').textContent = legs > 1 ? `Google Maps · Etappe ${route.leg + 1}/${legs}` : 'Navigieren mit Google Maps';
+  $('rtNav').href = legUrl(route, route.leg);
+  $('rtLegPrev').classList.toggle('hidden', legs < 2);
+  $('rtLegNext').classList.toggle('hidden', legs < 2);
+  $('routeResult').classList.remove('hidden');
+}
+function clearRoute() {
+  route = null;
+  $('routeResult').classList.add('hidden');
+  if (mapReady) map.getSource('route').setData(empty());
+}
+function bindRouteUi() {
+  $('routeBtn').addEventListener('click', openRoutePanel);
+  $('rtClose').addEventListener('click', () => $('routeCard').classList.add('hidden'));
+  $('rtMode').addEventListener('click', e => { const b = e.target.closest('button'); if (b) { routeUi.mode = b.dataset.mode; renderRouteChips(); } });
+  $('rtChips').addEventListener('click', e => {
+    const b = e.target.closest('[data-v]'); if (!b) return;
+    if (routeUi.mode === 'time') routeUi.minutes = +b.dataset.v; else routeUi.radius = +b.dataset.v;
+    renderRouteChips();
+  });
+  $('rtGo').addEventListener('click', runPlanner);
+  $('rtDiscard').addEventListener('click', clearRoute);
+  $('rtDrive').addEventListener('click', () => { $('routeResult').classList.add('hidden'); startDrive(); });
+  // Nach dem Öffnen von Google Maps automatisch zur nächsten Etappe weiterschalten
+  $('rtNav').addEventListener('click', () => setTimeout(() => {
+    if (route && route.leg < legCount(route) - 1) { route.leg++; showRouteResult(); }
+  }, 1500));
+  $('rtLegPrev').addEventListener('click', () => { if (route.leg > 0) { route.leg--; showRouteResult(); } });
+  $('rtLegNext').addEventListener('click', () => { if (route.leg < legCount(route) - 1) { route.leg++; showRouteResult(); } });
+}
+
 // ───────────────────────── Fahrmodus ─────────────────────────
 const drive = { on: false, watch: null, wake: null, last: null, buf: null, newLen: 0, followPause: 0, lastRender: 0, lastNameT: 0, speed: null };
 
@@ -622,6 +953,7 @@ async function stopDrive() {
   await saveCoverage();
   renderDriven(); renderHud(); renderDataInfo();
   toast(`Fahrmodus beendet · +${km(drive.newLen)} km neu`, 4000);
+  if (route) showRouteResult();
 }
 
 // ───────────────────────── HUD & Statistik ─────────────────────────
@@ -809,6 +1141,7 @@ function bindUi() {
   document.querySelectorAll('[data-panel]').forEach(b => b.addEventListener('click', () => {
     const id = b.dataset.panel;
     closeExplore();
+    $('routeCard').classList.add('hidden');
     if (id === 'stats') renderStats();
     if (id === 'settings') fillSettings();
     $(`panel-${id}`).classList.remove('hidden');
@@ -819,6 +1152,7 @@ function bindUi() {
   $('exClose').addEventListener('click', closeExplore);
   $('locateBtn').addEventListener('click', () => geo && geo.trigger());
   $('driveBtn').addEventListener('click', startDrive);
+  bindRouteUi();
   $('drvStop').addEventListener('click', stopDrive);
   $('drvCenter').addEventListener('click', () => { drive.followPause = 0; if (drive.last) map.easeTo({ center: [drive.last.lon, drive.last.lat], zoom: 16 }); });
   $('statsBody').addEventListener('click', e => { const b = e.target.closest('[data-trip]'); if (b) toggleVehicle(b.dataset.trip); });
@@ -899,13 +1233,13 @@ async function main() {
   await mapP;
   renderNetwork(); renderDriven(); renderHud();
   setLoading(null);
-  if (!cfg.url) toast('Tipp: Empfänger unter ⚙ Einstellungen einrichten', 5000);
+  if (!cfg.url) toast('Tipp: Empfänger unter ⚙ Optionen einrichten', 5000);
   sync(false);
   setInterval(() => { if (document.visibilityState === 'visible') { renderHud(); if (Date.now() - lastSync > 5 * 60e3) sync(false); } }, 60e3);
 }
 
 // Für Tests
-window.__erkunder = { get R() { return R; }, get CF() { return CF; }, get P() { return P; }, computeTrips, coverageStats, findTarget, importGpx, drive, onDrivePos };
+window.__erkunder = { get R() { return R; }, get CF() { return CF; }, get P() { return P; }, computeTrips, coverageStats, findTarget, importGpx, drive, onDrivePos, planRoute, get route() { return route; }, get G() { return G; } };
 
 main();
 })();

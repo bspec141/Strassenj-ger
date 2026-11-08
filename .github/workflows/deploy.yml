@@ -30,7 +30,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/data/roads.json
-          key: roads-zh-v1-${{ steps.month.outputs.key }}
+          key: roads-zh-v2-${{ steps.month.outputs.key }}
       - name: Strassennetz Kanton Zürich laden (OpenStreetMap)
         if: steps.cache.outputs.cache-hit != 'true'
         run: node scripts/build-roads.mjs public/data/roads.json

@@ -133,3 +133,14 @@ input[type=url], input[type=text] { width: 100%; margin-top: 4px; padding: 10px 
 .drv-btn.stop { background: #ff4d4d; color: #fff; border: 0; font-size: 16px; }
 body.driving #driveBar { display: flex; }
 body.driving #dock, body.driving #driveBtn, body.driving #locateBtn, body.driving #exploreCard { display: none !important; }
+
+/* Routenplanung */
+.seg { display: flex; background: rgba(255,255,255,.06); border-radius: 11px; padding: 3px; margin-top: 12px; }
+.seg button { flex: 1; background: none; border: 0; color: var(--muted); font: inherit; font-weight: 600; padding: 8px; border-radius: 9px; }
+.seg button.on { background: rgba(255,61,242,.18); color: #fff; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+.chip { background: rgba(255,255,255,.06); border: 1px solid var(--line); color: var(--text); font: inherit; font-weight: 600;
+  padding: 8px 12px; border-radius: 999px; }
+.chip.on { background: #ff3df2; color: #1a001a; border-color: transparent; }
+#routeCard .btn.primary, #routeResult .btn.primary { background: #ff3df2; color: #1a001a; }
+body.driving #routeCard, body.driving #routeResult { display: none !important; }
