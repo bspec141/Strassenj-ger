@@ -80,6 +80,8 @@ async function fetchTile(QUERY, label) {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = await res.json();
         if (!Array.isArray(json.elements)) throw new Error('Ungültige Antwort');
+        // Manche Server liefern bei Überlast stillschweigend eine leere Antwort
+        if (json.elements.length === 0) throw new Error('Leere Antwort');
         if (json.remark && /error|timeout|runtime/i.test(json.remark)) throw new Error(json.remark);
         console.log(`  ${json.elements.length} Elemente`);
         return json;
