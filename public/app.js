@@ -387,7 +387,7 @@ async function initMap() {
     style = await r.json();
     for (const l of style.layers) {
       if (l.type === 'line' && l['source-layer'] === 'transportation') {
-        l.paint = { ...(l.paint || {}), 'line-opacity': 0.25 };
+        l.paint = { ...(l.paint || {}), 'line-opacity': 0.55 };
       }
     }
   } catch {
@@ -412,12 +412,12 @@ async function initMap() {
   const cf = ['match', ['get', 'c'], [0, 1], 1.6, [2, 3], 1.3, 1];
   const wc = (a, b, c, d) => ['interpolate', ['exponential', 1.6], ['zoom'], 8, ['*', cf, a], 12, ['*', cf, b], 15, ['*', cf, c], 18, ['*', cf, d]];
   map.addLayer({ id: 'network', type: 'line', source: 'network',
-    layout: { 'line-cap': 'round', 'line-join': 'round', visibility: cfg.network ? 'visible' : 'none' },
+    layout: { 'line-cap': 'round', 'line-join': 'round', visibility: 'none' },
     paint: { 'line-color': '#6f7a8c', 'line-opacity': 0.55,
       'line-width': wc(0.3, 0.9, 2.2, 6) } }, before);
-  const col = ['case', ['get', 'r'], '#ffb300', '#00e5ff'];
+  const col = '#00e5ff';
   map.addLayer({ id: 'driven-glow', type: 'line', source: 'driven', layout: { 'line-cap': 'round', 'line-join': 'round' },
-    paint: { 'line-color': col, 'line-opacity': 0.35, 'line-blur': w(2, 3, 5, 8), 'line-width': w(3, 5, 11, 26) } }, before);
+    paint: { 'line-color': col, 'line-opacity': 0.3, 'line-blur': w(2, 3, 5, 8), 'line-width': w(3, 5, 11, 26) } }, before);
   map.addLayer({ id: 'driven', type: 'line', source: 'driven', layout: { 'line-cap': 'round', 'line-join': 'round' },
     paint: { 'line-color': col, 'line-width': w(0.9, 1.8, 3.6, 9) } }, before);
   map.addLayer({ id: 'target-line', type: 'line', source: 'target', filter: ['==', ['geometry-type'], 'LineString'],
@@ -450,6 +450,7 @@ async function initMap() {
 const empty = () => ({ type: 'FeatureCollection', features: [] });
 
 function renderNetwork() {
+  return; // Eigenes Strassennetz wird nicht mehr gezeichnet – die Hintergrundkarte zeigt überall die Strassen
   if (!mapReady) return;
   const feats = new Array(R.W);
   for (let w = 0; w < R.W; w++) feats[w] = { type: 'Feature', properties: { c: R.wayClass[w] }, geometry: { type: 'LineString', coordinates: R.lines[w] } };
@@ -1359,7 +1360,7 @@ function overlandUrl() {
 function fillSettings() {
   $('cfgUrl').value = cfg.url; $('cfgToken').value = cfg.token;
   $('overlandUrl').value = overlandUrl() || '(zuerst Worker-URL und Token speichern)';
-  $('optGmApp').checked = cfg.gmApp; $('optMotorway').checked = cfg.motorway; $('optNetwork').checked = cfg.network;
+  $('optGmApp').checked = cfg.gmApp; $('optMotorway').checked = cfg.motorway;
   renderDataInfo();
 }
 function renderDataInfo() {
@@ -1412,10 +1413,6 @@ function bindUi() {
   });
   $('optGmApp').addEventListener('change', e => { cfg.gmApp = e.target.checked; saveCfg(); });
   $('optMotorway').addEventListener('change', e => { cfg.motorway = e.target.checked; saveCfg(); });
-  $('optNetwork').addEventListener('change', e => {
-    cfg.network = e.target.checked; saveCfg();
-    if (mapReady) map.setLayoutProperty('network', 'visibility', cfg.network ? 'visible' : 'none');
-  });
   $('photoInput').addEventListener('change', async e => { const f = e.target.files[0]; e.target.value = ''; if (f) await importPhotos(f); });
   $('gpxInput').addEventListener('change', async e => { const f = [...e.target.files]; e.target.value = ''; if (f.length) await importGpx(f); });
   $('recompute').addEventListener('click', async () => {

@@ -41,7 +41,7 @@ Die Strassendaten werden monatlich automatisch aktualisiert.
 Fertig: Overland schickt die Punkte automatisch, die Web-App holt sie beim Öffnen ab.
 
 ## Funktionen
-- Erkundete Strassen leuchten (cyan, die letzten 7 Tage orange), unerkundete grau
+- Erkundete Strassen leuchten blau, die Hintergrundkarte zeigt alle anderen Strassen grau
 - **Erkunden**: schlägt die nächste unerkundete Strasse vor → „Navigieren mit Google Maps“
 - **Route planen**: Tour durch unerkundete Strassen nach Zeit (15 Min–2 h) oder Umkreis, optional zurück
   zum Start; beachtet Einbahnstrassen; Navigation in Etappen à 9 Stopps über Google Maps oder im Fahrmodus
