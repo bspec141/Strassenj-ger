@@ -17,9 +17,12 @@ export const CLASSES = [
   'unclassified', 'residential', 'living_street',
 ];
 
-const QUERY = `[out:json][timeout:900][maxsize:2000000000];
+// Kanton Zürich grob als Rechteck, in Kacheln aufgeteilt (kleinere Abfragen = weniger Server-Timeouts)
+const BBOX = { s: 47.15, w: 8.35, n: 47.70, e: 8.99 };
+const TILES = 3;
+const query = (s, w, n, e) => `[out:json][timeout:300];
 area${AREA_FILTER}->.a;
-way(area.a)
+way(area.a)(${s},${w},${n},${e})
   ["highway"~"^((motorway|trunk|primary|secondary|tertiary)(_link)?|unclassified|residential|living_street)$"]
   ["area"!="yes"]
   ["access"!~"^(no|private)$"]
@@ -34,11 +37,23 @@ const ENDPOINTS = [
 ];
 
 async function fetchOverpass() {
+  const byId = new Map();
+  const dLat = (BBOX.n - BBOX.s) / TILES, dLon = (BBOX.e - BBOX.w) / TILES;
+  for (let i = 0; i < TILES; i++) for (let j = 0; j < TILES; j++) {
+    const q = query(BBOX.s + i * dLat, BBOX.w + j * dLon, BBOX.s + (i + 1) * dLat, BBOX.w + (j + 1) * dLon);
+    const json = await fetchTile(q, `${i * TILES + j + 1}/${TILES * TILES}`);
+    for (const el of json.elements) if (el.type === 'way') byId.set(el.id, el);
+  }
+  if (byId.size < 5000) throw new Error(`Zu wenige Strassen (${byId.size})`);
+  return { elements: [...byId.values()] };
+}
+
+async function fetchTile(QUERY, label) {
   let lastErr;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 4; attempt++) {
     for (const url of ENDPOINTS) {
       try {
-        console.log(`Overpass: ${url} (Versuch ${attempt + 1})`);
+        console.log(`Kachel ${label}: ${url} (Versuch ${attempt + 1})`);
         const res = await fetch(url, {
           method: 'POST',
           headers: {
@@ -49,16 +64,16 @@ async function fetchOverpass() {
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = await res.json();
-        if (!Array.isArray(json.elements) || json.elements.length < 1000) {
-          throw new Error(`Zu wenige Elemente (${json.elements?.length}) – ${json.remark || ''}`);
-        }
+        if (!Array.isArray(json.elements)) throw new Error('Ungültige Antwort');
+        if (json.remark && /error|timeout|runtime/i.test(json.remark)) throw new Error(json.remark);
+        console.log(`  ${json.elements.length} Elemente`);
         return json;
       } catch (e) {
         lastErr = e;
         console.warn(`  fehlgeschlagen: ${e.message}`);
       }
     }
-    await new Promise(r => setTimeout(r, 30000 * (attempt + 1)));
+    await new Promise(r => setTimeout(r, 20000 * (attempt + 1)));
   }
   throw lastErr;
 }

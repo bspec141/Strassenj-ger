@@ -26,14 +26,33 @@ jobs:
           node-version: 22
       - id: month
         run: echo "key=$(date +%Y-%m)" >> "$GITHUB_OUTPUT"
+      # Letzte Strassendaten wiederherstellen (auch ältere als Notfall-Reserve)
       - id: cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: public/data/roads.json
           key: roads-zh-v2-${{ steps.month.outputs.key }}
+          restore-keys: |
+            roads-zh-v2-
+            roads-zh-v1-
       - name: Strassennetz Kanton Zürich laden (OpenStreetMap)
+        id: fetch
         if: steps.cache.outputs.cache-hit != 'true'
-        run: node scripts/build-roads.mjs public/data/roads.json
+        continue-on-error: true
+        timeout-minutes: 40
+        run: |
+          node scripts/build-roads.mjs public/data/roads.new.json
+          mv public/data/roads.new.json public/data/roads.json
+      - name: Neue Strassendaten speichern
+        if: steps.fetch.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: public/data/roads.json
+          key: roads-zh-v2-${{ steps.month.outputs.key }}
+      - name: Strassendaten vorhanden?
+        run: |
+          test -s public/data/roads.json || { echo "::error::Keine Strassendaten – OpenStreetMap-Server später erneut versuchen"; exit 1; }
+          if [ "${{ steps.fetch.outcome }}" = "failure" ]; then echo "::warning::OpenStreetMap nicht erreichbar – verwende ältere Strassendaten"; fi
       - uses: actions/upload-pages-artifact@v3
         with:
           path: public
