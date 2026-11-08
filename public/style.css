@@ -119,3 +119,17 @@ input[type=url], input[type=text] { width: 100%; margin-top: 4px; padding: 10px 
 .maplibregl-ctrl-attrib a { color: var(--muted) !important; }
 .maplibregl-ctrl-bottom-right { bottom: calc(var(--sab) + 76px); }
 .maplibregl-ctrl-top-right { display: none; }
+
+/* Fahrmodus */
+.fab-drive { position: fixed; right: 12px; bottom: calc(var(--sab) + 152px); height: 42px; padding: 0 16px; border-radius: 21px;
+  background: var(--panel); border: 1px solid rgba(0,229,255,.45); color: var(--accent); font: inherit; font-weight: 700; z-index: 5; }
+#driveBar { display: none; position: fixed; left: 12px; right: 12px; bottom: calc(var(--sab) + 12px); max-width: 520px; margin: 0 auto;
+  gap: 8px; align-items: stretch; z-index: 6; }
+.drv-stat { flex: 1; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 8px 10px; text-align: center; }
+.drv-stat .v { font-size: 30px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.drv-stat .v.accent { color: var(--accent); }
+.drv-stat .l { color: var(--muted); font-size: 12px; }
+.drv-btn { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; color: var(--text); font: inherit; font-weight: 700; font-size: 22px; padding: 0 16px; }
+.drv-btn.stop { background: #ff4d4d; color: #fff; border: 0; font-size: 16px; }
+body.driving #driveBar { display: flex; }
+body.driving #dock, body.driving #driveBtn, body.driving #locateBtn, body.driving #exploreCard { display: none !important; }

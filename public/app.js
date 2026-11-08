@@ -264,24 +264,26 @@ function processFrom(tFrom) {
   };
   for (; i < n; i++) {
     if (acc[i] > MAX_ACC) continue;
-    if (prev >= 0) {
-      const dt = t[i] - t[prev];
-      const ax = px(lon[prev]), ay = py(lat[prev]), bx = px(lon[i]), by = py(lat[i]);
-      const d = Math.hypot(bx - ax, by - ay);
-      const v = d / (dt / 1000);
-      if (dt > 0 && dt <= MAX_GAP_T && d <= MAX_GAP_D && v >= MIN_SPEED && v <= MAX_SPEED) {
-        const hx = (bx - ax) / d, hy = (by - ay) / d;
-        const steps = Math.max(1, Math.ceil(d / STEP));
-        for (let k = 0; k <= steps; k++) {
-          const f = k / steps;
-          const s = nearestSeg(ax + (bx - ax) * f, ay + (by - ay) * f, hx, hy, MATCH_R, false);
-          if (s >= 0) mark(R.segChunk[s], t[prev] + dt * f);
-        }
-      }
-    }
+    if (prev >= 0) matchPair(t[prev], lat[prev], lon[prev], t[i], lat[i], lon[i], mark);
     prev = i;
   }
   return newly;
+}
+
+// Ordnet die Strecke zwischen zwei GPS-Punkten den Strassenstücken zu
+function matchPair(t0, lat0, lon0, t1, lat1, lon1, mark) {
+  const dt = t1 - t0;
+  const ax = px(lon0), ay = py(lat0), bx = px(lon1), by = py(lat1);
+  const d = Math.hypot(bx - ax, by - ay);
+  const v = d / (dt / 1000);
+  if (!(dt > 0 && dt <= MAX_GAP_T && d <= MAX_GAP_D && v >= MIN_SPEED && v <= MAX_SPEED)) return;
+  const hx = (bx - ax) / d, hy = (by - ay) / d;
+  const steps = Math.max(1, Math.ceil(d / STEP));
+  for (let k = 0; k <= steps; k++) {
+    const f = k / steps;
+    const s = nearestSeg(ax + (bx - ax) * f, ay + (by - ay) * f, hx, hy, MATCH_R, false);
+    if (s >= 0) mark(R.segChunk[s], t0 + dt * f);
+  }
 }
 
 async function saveCoverage() {
@@ -400,6 +402,10 @@ async function initMap() {
   map.addLayer({ id: 'target-pt', type: 'circle', source: 'target', filter: ['==', ['geometry-type'], 'Point'],
     paint: { 'circle-radius': 9, 'circle-color': '#ff3df2', 'circle-stroke-color': '#fff', 'circle-stroke-width': 2.5 } });
 
+  map.addSource('me', { type: 'geojson', data: empty() });
+  map.addLayer({ id: 'me-halo', type: 'circle', source: 'me', paint: { 'circle-radius': 18, 'circle-color': '#3d8bff', 'circle-opacity': 0.2 } });
+  map.addLayer({ id: 'me', type: 'circle', source: 'me', paint: { 'circle-radius': 8, 'circle-color': '#3d8bff', 'circle-stroke-color': '#fff', 'circle-stroke-width': 3 } });
+  map.on('dragstart', () => { if (drive.on) drive.followPause = Date.now() + 15000; });
   map.on('click', onMapClick);
   mapReady = true;
 }
@@ -535,6 +541,87 @@ async function startExplore(next) {
 function closeExplore() {
   $('exploreCard').classList.add('hidden');
   if (mapReady) map.getSource('target').setData(empty());
+}
+
+// ───────────────────────── Fahrmodus ─────────────────────────
+const drive = { on: false, watch: null, wake: null, last: null, buf: null, newLen: 0, followPause: 0, lastRender: 0, lastNameT: 0, speed: null };
+
+async function startDrive() {
+  if (!R || !mapReady || drive.on) return;
+  if (!navigator.geolocation) { toast('Kein GPS verfügbar'); return; }
+  Object.assign(drive, { on: true, last: null, buf: { t: [], lat: [], lon: [], acc: [], spd: [] }, newLen: 0, followPause: 0, speed: null });
+  $('exploreCard').classList.add('hidden');
+  document.body.classList.add('driving');
+  updateDriveBar();
+  await requestWake();
+  drive.watch = navigator.geolocation.watchPosition(onDrivePos, onDriveErr, { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 });
+}
+
+async function requestWake() {
+  try {
+    if ('wakeLock' in navigator) { drive.wake = await navigator.wakeLock.request('screen'); return; }
+  } catch {}
+  toast('Bildschirm bleibt evtl. nicht an – ggf. automatische Sperre ausschalten', 5000);
+}
+
+function onDrivePos(pos) {
+  if (!drive.on) return;
+  const c = pos.coords, t = pos.timestamp || Date.now();
+  const lon = c.longitude, lat = c.latitude, acc = c.accuracy;
+  drive.speed = c.speed != null && c.speed >= 0 ? c.speed : null;
+  if (drive.speed == null && drive.last && t - drive.last.t >= 500) {
+    drive.speed = Math.hypot(px(lon) - px(drive.last.lon), py(lat) - py(drive.last.lat)) / ((t - drive.last.t) / 1000);
+  }
+  map.getSource('me').setData({ type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: [lon, lat] } });
+  if (Date.now() > drive.followPause) map.easeTo({ center: [lon, lat], zoom: Math.max(map.getZoom(), 15), duration: 900 });
+
+  if (!(acc > MAX_ACC)) {
+    const b = drive.buf;
+    b.t.push(t); b.lat.push(lat); b.lon.push(lon); b.acc.push(acc ?? null); b.spd.push(drive.speed);
+    if (drive.last && t > drive.last.t) {
+      let gained = 0, firstNew = -1;
+      matchPair(drive.last.t, drive.last.lat, drive.last.lon, t, lat, lon, (ci, ts) => {
+        if (CF[ci] === 0) { CF[ci] = ts; gained += R.chunkLen[ci]; if (firstNew < 0) firstNew = ci; }
+        else if (ts < CF[ci]) CF[ci] = ts;
+      });
+      if (gained) {
+        drive.newLen += gained;
+        const now = Date.now();
+        if (now - drive.lastRender > 3000) { drive.lastRender = now; renderDriven(); renderHud(); }
+        const name = R.names[R.wayName[R.chunkWay[firstNew]]];
+        if (name && now - drive.lastNameT > 5000) { drive.lastNameT = now; toast(`✦ Neu: ${name}`, 2500); }
+      }
+    }
+    drive.last = { t, lat, lon };
+  }
+  updateDriveBar();
+}
+
+function onDriveErr(e) {
+  if (e.code === 1) { toast('Standortzugriff verweigert'); stopDrive(); }
+}
+
+function updateDriveBar() {
+  $('drvSpeed').textContent = drive.speed == null ? '–' : nf0.format(drive.speed * 3.6);
+  $('drvNew').textContent = km(drive.newLen);
+}
+
+async function stopDrive() {
+  if (!drive.on) return;
+  drive.on = false;
+  if (drive.watch != null) navigator.geolocation.clearWatch(drive.watch);
+  try { await drive.wake?.release(); } catch {}
+  drive.wake = null;
+  document.body.classList.remove('driving');
+  map.getSource('me').setData(empty());
+  if (drive.buf.t.length) {
+    await idb.addBatch(drive.buf);
+    batches.push(drive.buf);
+    P = buildPoints(batches);
+  }
+  await saveCoverage();
+  renderDriven(); renderHud(); renderDataInfo();
+  toast(`Fahrmodus beendet · +${km(drive.newLen)} km neu`, 4000);
 }
 
 // ───────────────────────── HUD & Statistik ─────────────────────────
@@ -731,6 +818,9 @@ function bindUi() {
   $('exNext').addEventListener('click', () => startExplore(true));
   $('exClose').addEventListener('click', closeExplore);
   $('locateBtn').addEventListener('click', () => geo && geo.trigger());
+  $('driveBtn').addEventListener('click', startDrive);
+  $('drvStop').addEventListener('click', stopDrive);
+  $('drvCenter').addEventListener('click', () => { drive.followPause = 0; if (drive.last) map.easeTo({ center: [drive.last.lon, drive.last.lat], zoom: 16 }); });
   $('statsBody').addEventListener('click', e => { const b = e.target.closest('[data-trip]'); if (b) toggleVehicle(b.dataset.trip); });
 
   $('genToken').addEventListener('click', () => { $('cfgToken').value = randomToken(); });
@@ -766,6 +856,7 @@ function bindUi() {
     await idb.clear(); location.reload();
   });
   document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && drive.on) requestWake();
     if (document.visibilityState === 'visible' && Date.now() - lastSync > 60e3) sync(false);
   });
 }
@@ -814,7 +905,7 @@ async function main() {
 }
 
 // Für Tests
-window.__erkunder = { get R() { return R; }, get CF() { return CF; }, get P() { return P; }, computeTrips, coverageStats, findTarget, importGpx };
+window.__erkunder = { get R() { return R; }, get CF() { return CF; }, get P() { return P; }, computeTrips, coverageStats, findTarget, importGpx, drive, onDrivePos };
 
 main();
 })();

@@ -43,6 +43,7 @@ Fertig: Overland schickt die Punkte automatisch, die Web-App holt sie beim Öffn
 ## Funktionen
 - Erkundete Strassen leuchten (cyan, die letzten 7 Tage orange), unerkundete grau
 - **Erkunden**: schlägt die nächste unerkundete Strasse vor → „Navigieren mit Google Maps“
+- **Fahrmodus**: Bildschirm bleibt an, Karte folgt dir, Strassen leuchten live auf, Tempo + neue km
 - Antippen einer beliebigen Strasse: Status + „Hierhin navigieren“
 - Statistik: % des Kantons, neue km pro Woche, nach Strassentyp, Fahrten, Fahrzeit,
   Höchstgeschwindigkeit, Auto/Motorrad (in der Fahrtenliste auf 🚗 tippen zum Umschalten)
