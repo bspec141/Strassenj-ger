@@ -31,10 +31,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: public/data/roads.json
-          key: roads-zh-v2-${{ steps.month.outputs.key }}
+          key: roads-zh-v3-${{ steps.month.outputs.key }}
           restore-keys: |
+            roads-zh-v3-
             roads-zh-v2-
-            roads-zh-v1-
       - name: Strassennetz Kanton Zürich laden (OpenStreetMap)
         id: fetch
         if: steps.cache.outputs.cache-hit != 'true'
@@ -48,7 +48,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: public/data/roads.json
-          key: roads-zh-v2-${{ steps.month.outputs.key }}
+          key: roads-zh-v3-${{ steps.month.outputs.key }}
       - name: Strassendaten vorhanden?
         run: |
           test -s public/data/roads.json || { echo "::error::Keine Strassendaten – OpenStreetMap-Server später erneut versuchen"; exit 1; }

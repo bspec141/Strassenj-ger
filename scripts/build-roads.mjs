@@ -8,7 +8,7 @@ import { writeFile, mkdir, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 const OUT = process.argv[2] || 'public/data/roads.json';
-const REGION = 'Kanton Zürich';
+const REGION = 'Kanton Zürich + 10 km Umgebung';
 const AREA_FILTER = '["ISO3166-2"="CH-ZH"]["admin_level"="4"]';
 
 // Reihenfolge = Klassen-Index in der Ausgabedatei
@@ -20,8 +20,12 @@ export const CLASSES = [
 // Kanton Zürich grob als Rechteck, in Kacheln aufgeteilt (kleinere Abfragen = weniger Server-Timeouts)
 const BBOX = { s: 47.15, w: 8.35, n: 47.70, e: 8.99 };
 const TILES = 3;
-const query = (s, w, n, e) => `[out:json][timeout:300];
-area${AREA_FILTER}->.a;
+// Umgebung: ca. 10 km um den Kanton herum, nur Schweizer Gebiet
+const OUTER = { s: 47.06, w: 8.22, n: 47.79, e: 9.12 };
+const OUTER_TILES = 4;
+const CH_FILTER = '["ISO3166-1"="CH"]["admin_level"="2"]';
+const query = (s, w, n, e, area = AREA_FILTER) => `[out:json][timeout:300];
+area${area}->.a;
 way(area.a)(${s},${w},${n},${e})
   ["highway"~"^((motorway|trunk|primary|secondary|tertiary)(_link)?|unclassified|residential|living_street)$"]
   ["area"!="yes"]
@@ -38,13 +42,24 @@ const ENDPOINTS = [
 
 async function fetchOverpass() {
   const byId = new Map();
-  const dLat = (BBOX.n - BBOX.s) / TILES, dLon = (BBOX.e - BBOX.w) / TILES;
-  for (let i = 0; i < TILES; i++) for (let j = 0; j < TILES; j++) {
-    const q = query(BBOX.s + i * dLat, BBOX.w + j * dLon, BBOX.s + (i + 1) * dLat, BBOX.w + (j + 1) * dLon);
-    const json = await fetchTile(q, `${i * TILES + j + 1}/${TILES * TILES}`);
-    for (const el of json.elements) if (el.type === 'way') byId.set(el.id, el);
-  }
-  if (byId.size < 5000) throw new Error(`Zu wenige Strassen (${byId.size})`);
+  const grid = async (box, n, area, label, zh) => {
+    const dLat = (box.n - box.s) / n, dLon = (box.e - box.w) / n;
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+      const q = query(box.s + i * dLat, box.w + j * dLon, box.s + (i + 1) * dLat, box.w + (j + 1) * dLon, area);
+      const json = await fetchTile(q, `${label} ${i * n + j + 1}/${n * n}`);
+      for (const el of json.elements) {
+        if (el.type !== 'way') continue;
+        const prev = byId.get(el.id);
+        el.zh = zh || !!prev?.zh;
+        byId.set(el.id, el);
+      }
+    }
+  };
+  await grid(BBOX, TILES, AREA_FILTER, 'Zürich', true);
+  const zhCount = byId.size;
+  if (zhCount < 5000) throw new Error(`Zu wenige Strassen (${zhCount})`);
+  await grid(OUTER, OUTER_TILES, CH_FILTER, 'Umgebung', false);
+  console.log(`${zhCount} Strassen im Kanton, ${byId.size - zhCount} in der Umgebung`);
   return { elements: [...byId.values()] };
 }
 
@@ -100,7 +115,9 @@ export function convert(osm, generated = new Date().toISOString()) {
     else if (ow === '-1' || ow === 'reverse') one = 2;
     else if (ow !== 'no' && (el.tags.highway === 'motorway' || el.tags.highway === 'motorway_link'
       || el.tags.junction === 'roundabout' || el.tags.junction === 'circular')) one = 1;
-    const row = [c | (one << 4), n];
+    // Bit 6: liegt (auch) im Kanton Zürich
+    const inZh = el.zh !== false ? 1 : 0;
+    const row = [c | (one << 4) | (inZh << 6), n];
     let px = 0, py = 0, prev = null;
     for (const g of el.geometry) {
       if (!g) continue; // Overpass liefert null für Knoten ausserhalb
@@ -112,7 +129,7 @@ export function convert(osm, generated = new Date().toISOString()) {
     }
     if (row.length >= 6) ways.push(row);
   }
-  return { v: 2, generated, region: REGION, attribution: '© OpenStreetMap-Mitwirkende (ODbL)',
+  return { v: 3, generated, region: REGION, attribution: '© OpenStreetMap-Mitwirkende (ODbL)',
     classes: CLASSES, totalKm: Math.round(totalM / 100) / 10, names, ways };
 }
 

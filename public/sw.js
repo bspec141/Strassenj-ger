@@ -1,5 +1,5 @@
 // Netzwerk zuerst (mit Timeout), sonst Cache – damit die App auch bei schlechtem Empfang startet.
-const CACHE = 'strassenjaeger-v4';
+const CACHE = 'strassenjaeger-v5';
 const SHELL = ['./', 'index.html', 'app.js', 'style.css', 'manifest.webmanifest', 'icons/icon-192.png'];
 
 self.addEventListener('install', e => {

@@ -1,6 +1,6 @@
 # Strassenjäger
 
-Forza-artige Erkundungskarte für den Kanton Zürich: Strassen, die du schon gefahren bist, leuchten –
+Forza-artige Erkundungskarte für den Kanton Zürich (plus ca. 10 km Umgebung): Strassen, die du schon gefahren bist, leuchten –
 alle anderen sind grau. Mit Statistiken, „Erkunden“-Vorschlägen und Navigation über Google Maps.
 
 ```

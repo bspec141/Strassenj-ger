@@ -157,11 +157,14 @@ function buildRoads(data) {
   const sax = [], say = [], sbx = [], sby = [], segChunk = [];
   const chunkWay = [], chunkLen = [], chunkSeg0 = [];
   const classLen = new Float64Array(data.classes.length);
+  const wayZH = new Uint8Array(W);
+  let outerLen = 0;
 
   for (let w = 0; w < W; w++) {
     const row = data.ways[w];
     const cls = row[0] & 15;
-    wayClass[w] = cls; wayOne[w] = row[0] >> 4; wayName[w] = row[1];
+    wayClass[w] = cls; wayOne[w] = (row[0] >> 4) & 3; wayName[w] = row[1];
+    wayZH[w] = data.v >= 3 ? (row[0] >> 6) & 1 : 1;
     wayVert0[w] = vKey.length;
     wayChunk0[w] = chunkWay.length;
     const coords = [], X = [], Y = [];
@@ -205,7 +208,7 @@ function buildRoads(data) {
     }
     vSeg.push(sax.length);
     wayLen[w] = total;
-    classLen[cls] += total;
+    if (wayZH[w]) classLen[cls] += total; else outerLen += total;
   }
   wayChunk0[W] = chunkWay.length;
   wayVert0[W] = vKey.length;
@@ -232,7 +235,7 @@ function buildRoads(data) {
     vKey: Float64Array.from(vKey), vX: Float32Array.from(vX), vY: Float32Array.from(vY), vSeg: Uint32Array.from(vSeg), wayLen, wayChunk0, lines, names: data.names,
     SAX, SAY, SBX, SBY, segChunk: Uint32Array.from(segChunk),
     chunkWay: Uint32Array.from(chunkWay), chunkLen: Float32Array.from(chunkLen), chunkSeg0: Uint32Array.from(chunkSeg0),
-    grid, classLen, totalLen, version: data.generated,
+    grid, classLen, totalLen, outerLen, wayZH, version: data.generated,
   };
 }
 function cellKey(cx, cy) { return (cx + 5000) * 10000 + (cy + 5000); }
@@ -346,7 +349,7 @@ function computeTrips() {
 
 function coverageStats() {
   const classDriven = new Float64Array(R.classLen.length);
-  let driven = 0, drivenWeek = 0, drivenMonth = 0;
+  let driven = 0, drivenOuter = 0, drivenWeek = 0, drivenMonth = 0;
   const now = Date.now(), weekAgo = now - 7 * 864e5, monthAgo = now - 30 * 864e5;
   // Wochen-Balken (letzte 12 Wochen, ab Montag)
   const monday = new Date(); monday.setHours(0, 0, 0, 0); monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7));
@@ -356,13 +359,13 @@ function coverageStats() {
     const f = CF[c];
     if (!f) continue;
     const L = R.chunkLen[c];
-    driven += L;
-    classDriven[R.wayClass[R.chunkWay[c]]] += L;
+    const w = R.chunkWay[c];
+    if (R.wayZH[w]) { driven += L; classDriven[R.wayClass[w]] += L; } else drivenOuter += L;
     if (f >= weekAgo) drivenWeek += L;
     if (f >= monthAgo) drivenMonth += L;
     if (f >= w0) weeks[Math.min(11, Math.floor((f - w0) / (7 * 864e5)))] += L;
   }
-  return { driven, drivenWeek, drivenMonth, classDriven, weeks, w0 };
+  return { driven, drivenOuter, drivenWeek, drivenMonth, classDriven, weeks, w0 };
 }
 
 // ───────────────────────── Karte ─────────────────────────
@@ -977,6 +980,7 @@ function renderStats() {
   const tile = (v, unit, l, cls = '') => `<div class="tile ${cls}"><div class="v">${v}${unit ? `<small>${unit}</small>` : ''}</div><div class="l">${l}</div></div>`;
   let h = '<div class="tiles">';
   h += tile(`${pct(st.driven, R.totalLen)}`, '%', `vom Kanton Zürich erkundet · ${km(st.driven)} von ${km(R.totalLen)} km`, 'big');
+  if (R.outerLen > 0) h += tile(`${pct(st.drivenOuter, R.outerLen)}`, '%', `Umgebung (10 km um ZH) · ${km(st.drivenOuter)} von ${km(R.outerLen)} km`, 'big outer');
   h += tile(`+${km(st.drivenWeek)}`, 'km', 'neue Strassen (7 Tage)');
   h += tile(`+${km(st.drivenMonth)}`, 'km', 'neue Strassen (30 Tage)');
   h += tile(km(dist), 'km', 'insgesamt gefahren');
@@ -989,7 +993,7 @@ function renderStats() {
   h += tile(`🏍️ ${km(moto)}`, 'km', 'Motorrad');
   h += '</div>';
 
-  h += '<h3>Nach Strassentyp</h3>';
+  h += '<h3>Nach Strassentyp (Kanton Zürich)</h3>';
   for (const [label, cls] of GROUPS) {
     let tot = 0, drv = 0;
     for (const c of cls) { tot += R.classLen[c]; drv += st.classDriven[c]; }
