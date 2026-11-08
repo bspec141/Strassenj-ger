@@ -1198,7 +1198,7 @@ function bindUi() {
 // ───────────────────────── Start ─────────────────────────
 async function main() {
   bindUi();
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).catch(() => {});
   await idb.open();
   const mapP = initMap();
 

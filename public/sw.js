@@ -1,5 +1,5 @@
 // Netzwerk zuerst (mit Timeout), sonst Cache – damit die App auch bei schlechtem Empfang startet.
-const CACHE = 'strassenjaeger-v3';
+const CACHE = 'strassenjaeger-v4';
 const SHELL = ['./', 'index.html', 'app.js', 'style.css', 'manifest.webmanifest', 'icons/icon-192.png'];
 
 self.addEventListener('install', e => {
@@ -20,7 +20,8 @@ self.addEventListener('fetch', e => {
     const timeout = url.pathname.endsWith('roads.json') ? 15000 : 4000;
     try {
       const res = await Promise.race([
-        fetch(req),
+        // eigene Dateien immer beim Server nachfragen (ETag), nicht 10 Min alten HTTP-Cache nehmen
+        fetch(req, url.origin === location.origin ? { cache: 'no-cache' } : undefined),
         new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), timeout)),
       ]);
       if (res.ok) cache.put(req, res.clone());
