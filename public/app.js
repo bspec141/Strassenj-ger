@@ -235,8 +235,18 @@ function buildRoads(data) {
     vKey: Float64Array.from(vKey), vX: Float32Array.from(vX), vY: Float32Array.from(vY), vSeg: Uint32Array.from(vSeg), wayLen, wayChunk0, lines, names: data.names,
     SAX, SAY, SBX, SBY, segChunk: Uint32Array.from(segChunk),
     chunkWay: Uint32Array.from(chunkWay), chunkLen: Float32Array.from(chunkLen), chunkSeg0: Uint32Array.from(chunkSeg0),
-    grid, classLen, totalLen, outerLen, wayZH, version: data.generated,
+    grid, classLen, totalLen, outerLen, wayZH, version: data.generated, box: bbox(vX, vY),
   };
+}
+function bbox(X, Y) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (let i = 0; i < X.length; i++) { if (X[i] < x0) x0 = X[i]; if (X[i] > x1) x1 = X[i]; if (Y[i] < y0) y0 = Y[i]; if (Y[i] > y1) y1 = Y[i]; }
+  return { x0, y0, x1, y1 };
+}
+// Liegt der Punkt im Gebiet mit Strassendaten? (margin in m)
+function inRoadArea(lon, lat, margin = 0) {
+  const x = px(lon), y = py(lat), b = R.box;
+  return x >= b.x0 - margin && x <= b.x1 + margin && y >= b.y0 - margin && y <= b.y1 + margin;
 }
 function cellKey(cx, cy) { return (cx + 5000) * 10000 + (cy + 5000); }
 
@@ -384,7 +394,7 @@ async function initMap() {
     style = { version: 8, sources: {}, layers: [{ id: 'bg', type: 'background', paint: { 'background-color': '#0e121a' } }] };
   }
   map = new maplibregl.Map({
-    container: 'map', style, center: CENTER, zoom: 9.6, minZoom: 7, maxZoom: 19,
+    container: 'map', style, center: CENTER, zoom: 9.6, minZoom: 1.5, maxZoom: 19,
     dragRotate: false, pitchWithRotate: false, attributionControl: { compact: true },
   });
   map.touchZoomRotate.disableRotation();
@@ -415,6 +425,14 @@ async function initMap() {
   map.addLayer({ id: 'target-pt', type: 'circle', source: 'target', filter: ['==', ['geometry-type'], 'Point'],
     paint: { 'circle-radius': 9, 'circle-color': '#ff3df2', 'circle-stroke-color': '#fff', 'circle-stroke-width': 2.5 } });
 
+  map.addSource('tracks', { type: 'geojson', data: empty(), tolerance: 0.6 });
+  map.addSource('live', { type: 'geojson', data: empty() });
+  for (const src of ['tracks', 'live']) {
+    map.addLayer({ id: `${src}-glow`, type: 'line', source: src, layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: { 'line-color': '#00e5ff', 'line-opacity': 0.3, 'line-blur': w(2, 3, 5, 8), 'line-width': w(3, 5, 11, 26) } }, 'driven-glow');
+    map.addLayer({ id: src, type: 'line', source: src, layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: { 'line-color': '#00e5ff', 'line-width': w(1.2, 2, 3.6, 9) } }, 'driven-glow');
+  }
   map.addSource('route', { type: 'geojson', data: empty() });
   map.addLayer({ id: 'route-casing', type: 'line', source: 'route', filter: ['==', ['geometry-type'], 'LineString'],
     layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': '#2a0a2a', 'line-width': w(4, 6, 10, 18), 'line-opacity': 0.8 } });
@@ -483,6 +501,97 @@ function onMapClick(e) {
   new maplibregl.Popup({ closeButton: false, maxWidth: '260px' }).setLngLat(e.lngLat).setHTML(html).addTo(map);
 }
 
+// ───────────────────────── Fahrspuren (weltweit) & Länder ─────────────────────────
+let COUNTRIES = null, countriesLoading = null;
+function loadCountries() {
+  if (!countriesLoading) countriesLoading = fetch('geo/countries.json').then(r => r.json()).then(d => { COUNTRIES = d; return d; }).catch(() => null);
+  return countriesLoading;
+}
+function inRing(ring, x, y) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+function inCountry(c, lon, lat) {
+  if (lon < c.b[0] || lon > c.b[2] || lat < c.b[1] || lat > c.b[3]) return false;
+  for (const poly of c.p) {
+    if (!inRing(poly[0], lon, lat)) continue;
+    let hole = false;
+    for (let k = 1; k < poly.length; k++) if (inRing(poly[k], lon, lat)) { hole = true; break; }
+    if (!hole) return true;
+  }
+  return false;
+}
+function countryAt(lon, lat, hint) {
+  if (!COUNTRIES) return null;
+  if (hint && inCountry(hint, lon, lat)) return hint;
+  for (const c of COUNTRIES) if (inCountry(c, lon, lat)) return c;
+  return null;
+}
+const flag = c => c && c.length === 2 ? String.fromCodePoint(...[...c.toUpperCase()].map(ch => 0x1F1A5 + ch.charCodeAt(0))) : '🏳️';
+
+// Linien der GPS-Spuren ausserhalb des Strassendaten-Gebiets + km pro Land
+function computeTracks() {
+  const { t, lat, lon, acc, n } = P;
+  const lines = [], countries = new Map();
+  let line = null, lastAdded = null, prev = -1, trip = 0, cHint = null, cAcc = 1e9, curC = null;
+  let x0 = 180, y0 = 90, x1 = -180, y1 = -90;
+  const endLine = () => { if (line && line.length > 1) lines.push(line); line = null; lastAdded = null; };
+  for (let i = 0; i < n; i++) {
+    if (acc[i] > MAX_ACC) continue;
+    if (lon[i] < x0) x0 = lon[i]; if (lon[i] > x1) x1 = lon[i]; if (lat[i] < y0) y0 = lat[i]; if (lat[i] > y1) y1 = lat[i];
+    if (prev >= 0) {
+      const dt = t[i] - t[prev];
+      if (dt > TRIP_GAP) trip++;
+      const d = haversine(lat[prev], lon[prev], lat[i], lon[i]);
+      const v = d / (dt / 1000);
+      const moving = dt > 0 && dt <= 5 * 60e3 && d <= 5000 && v >= MIN_SPEED && v <= MAX_SPEED;
+      if (moving) {
+        cAcc += d;
+        if (cAcc >= 500 || !curC) { curC = countryAt(lon[i], lat[i], cHint) || curC; cHint = curC; cAcc = 0; }
+        if (curC) {
+          let e = countries.get(curC.c || curC.n);
+          if (!e) countries.set(curC.c || curC.n, e = { name: curC.n, code: curC.c, dist: 0, trips: new Set() });
+          e.dist += d; e.trips.add(trip);
+        }
+        const outside = !(inRoadArea(lon[prev], lat[prev]) && inRoadArea(lon[i], lat[i]));
+        if (outside) {
+          if (!line) { line = [[lon[prev], lat[prev]]]; lastAdded = prev; }
+          if (haversine(lat[lastAdded], lon[lastAdded], lat[i], lon[i]) >= 25) { line.push([lon[i], lat[i]]); lastAdded = i; }
+        } else endLine();
+      } else if (!(dt > 0 && dt <= 5 * 60e3 && d <= 5000)) { endLine(); curC = null; }
+    }
+    prev = i;
+  }
+  endLine();
+  return { lines, countries: [...countries.values()].sort((a, b) => b.dist - a.dist), bounds: n ? [[x0, y0], [x1, y1]] : null };
+}
+function haversine(lat1, lon1, lat2, lon2) {
+  const r = Math.PI / 180, dLat = (lat2 - lat1) * r, dLon = (lon2 - lon1) * r;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin(dLon / 2) ** 2;
+  return 12742018 * Math.asin(Math.sqrt(a));
+}
+let TRACKS = null;
+function renderTracks() {
+  TRACKS = computeTracks();
+  if (!mapReady) return;
+  map.getSource('tracks').setData({ type: 'FeatureCollection', features: TRACKS.lines.map(c => ({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: c } })) });
+}
+function renderLive() {
+  if (!mapReady) return;
+  const b = drive.buf, c = [];
+  if (b) for (let i = 0; i < b.t.length; i++) c.push([b.lon[i], b.lat[i]]);
+  map.getSource('live').setData(c.length > 1 ? { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: c } } : empty());
+}
+function showAllTrips() {
+  if (!TRACKS?.bounds) { toast('Noch keine Fahrten'); return; }
+  document.querySelectorAll('.sheet').forEach(s => s.classList.add('hidden'));
+  map.fitBounds(TRACKS.bounds, { padding: { top: 140, bottom: 120, left: 40, right: 40 }, maxZoom: 14, duration: 900 });
+}
+
 // ───────────────────────── Erkunden ─────────────────────────
 function navUrl(lat, lon) {
   const ll = `${lat.toFixed(6)},${lon.toFixed(6)}`;
@@ -532,6 +641,7 @@ async function startExplore(next) {
     explore.origin = pos || [map.getCenter().lng, map.getCenter().lat];
     if (!pos) toast('Kein Standort – verwende Kartenmitte', 2500);
   }
+  if (!inRoadArea(explore.origin[0], explore.origin[1], 5000)) { toast('Erkunden geht vorerst nur in Zürich + Umgebung', 4000); return; }
   const t = findTarget(explore.origin[0], explore.origin[1]);
   if (!t) { toast('Keine unerkundete Strasse gefunden 🎉'); return; }
   explore.excludeWays.add(t.w);
@@ -693,7 +803,7 @@ async function planRoute(startLonLat, opts) {
     const d2 = (G.nX[n] - sx) ** 2 + (G.nY[n] - sy) ** 2;
     if (d2 < bd && G.fwd.start[n + 1] > G.fwd.start[n]) { bd = d2; sNode = n; }
   }
-  if (sNode < 0 || bd > 2000 ** 2) return { error: 'Kein Strassennetz in deiner Nähe (nur Kanton Zürich).' };
+  if (sNode < 0 || bd > 2000 ** 2) return { error: 'Routenplanung geht vorerst nur in Zürich + Umgebung.' };
 
   // Erlaubte Zielkanten (im Umkreis, ohne Autobahn falls nicht gewünscht)
   const maxR2 = opts.mode === 'radius' ? (opts.radius * 1000) ** 2 : (T * 9 / 2) ** 2;
@@ -927,6 +1037,7 @@ function onDrivePos(pos) {
       }
     }
     drive.last = { t, lat, lon };
+    if (Date.now() - (drive.lastLive || 0) > 3000) { drive.lastLive = Date.now(); renderLive(); }
   }
   updateDriveBar();
 }
@@ -954,7 +1065,8 @@ async function stopDrive() {
     P = buildPoints(batches);
   }
   await saveCoverage();
-  renderDriven(); renderHud(); renderDataInfo();
+  drive.buf = null; renderLive();
+  renderDriven(); renderTracks(); renderHud(); renderDataInfo();
   toast(`Fahrmodus beendet · +${km(drive.newLen)} km neu`, 4000);
   if (route) showRouteResult();
 }
@@ -992,6 +1104,19 @@ function renderStats() {
   h += tile(`🚗 ${km(car)}`, 'km', 'Auto');
   h += tile(`🏍️ ${km(moto)}`, 'km', 'Motorrad');
   h += '</div>';
+
+  h += '<h3>Länder</h3>';
+  if (!COUNTRIES) { h += '<div class="empty">Länder werden geladen …</div>'; loadCountries().then(() => { TRACKS = computeTracks(); renderStats(); }); }
+  else if (!TRACKS?.countries.length) h += '<div class="empty">Noch keine Fahrten.</div>';
+  else {
+    const maxD = TRACKS.countries[0].dist;
+    h += `<div class="hint">${TRACKS.countries.length} ${TRACKS.countries.length === 1 ? 'Land' : 'Länder'} befahren</div>`;
+    for (const c of TRACKS.countries) {
+      h += `<div class="cls"><div class="cls-top"><span>${flag(c.code)} ${esc(c.name)}</span><span>${km(c.dist)} km · ${c.trips.size} ${c.trips.size === 1 ? 'Fahrt' : 'Fahrten'}</span></div>
+        <div class="bar"><div class="bar-fill" style="width:${100 * c.dist / maxD}%"></div></div></div>`;
+    }
+  }
+  h += '<button class="btn" id="showAll" style="width:100%;margin-top:10px">🗺️ Alle Fahrten auf der Karte zeigen</button>';
 
   h += '<h3>Nach Strassentyp (Kanton Zürich)</h3>';
   for (const [label, cls] of GROUPS) {
@@ -1079,7 +1204,7 @@ async function ingest(b) {
   for (const t of b.t) if (t < minT) minT = t;
   const newly = processFrom(minT - 60e3);
   await saveCoverage();
-  renderDriven(); renderHud();
+  renderDriven(); renderTracks(); renderHud();
   if (!$('panel-stats').classList.contains('hidden')) renderStats();
   renderDataInfo();
   if (newly >= 20) toast(`+${km(newly)} km neue Strassen erkundet!`, 5000);
@@ -1159,7 +1284,10 @@ function bindUi() {
   bindRouteUi();
   $('drvStop').addEventListener('click', stopDrive);
   $('drvCenter').addEventListener('click', () => { drive.followPause = 0; if (drive.last) map.easeTo({ center: [drive.last.lon, drive.last.lat], zoom: 16 }); });
-  $('statsBody').addEventListener('click', e => { const b = e.target.closest('[data-trip]'); if (b) toggleVehicle(b.dataset.trip); });
+  $('statsBody').addEventListener('click', e => {
+    if (e.target.closest('#showAll')) return showAllTrips();
+    const b = e.target.closest('[data-trip]'); if (b) toggleVehicle(b.dataset.trip);
+  });
 
   $('genToken').addEventListener('click', () => { $('cfgToken').value = randomToken(); });
   $('saveCfg').addEventListener('click', async () => {
@@ -1235,7 +1363,8 @@ async function main() {
   }
 
   await mapP;
-  renderNetwork(); renderDriven(); renderHud();
+  renderNetwork(); renderDriven(); renderTracks(); renderHud();
+  loadCountries().then(() => { renderTracks(); if (!$('panel-stats').classList.contains('hidden')) renderStats(); });
   setLoading(null);
   if (!cfg.url) toast('Tipp: Empfänger unter ⚙ Optionen einrichten', 5000);
   sync(false);
@@ -1243,7 +1372,7 @@ async function main() {
 }
 
 // Für Tests
-window.__erkunder = { get R() { return R; }, get CF() { return CF; }, get P() { return P; }, computeTrips, coverageStats, findTarget, importGpx, drive, onDrivePos, planRoute, get route() { return route; }, get G() { return G; } };
+window.__erkunder = { get R() { return R; }, get CF() { return CF; }, get P() { return P; }, computeTrips, coverageStats, findTarget, importGpx, drive, onDrivePos, planRoute, computeTracks, get TRACKS() { return TRACKS; }, get route() { return route; }, get G() { return G; } };
 
 main();
 })();

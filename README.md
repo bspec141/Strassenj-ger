@@ -49,6 +49,8 @@ Fertig: Overland schickt die Punkte automatisch, die Web-App holt sie beim Öffn
 - Antippen einer beliebigen Strasse: Status + „Hierhin navigieren“
 - Statistik: % des Kantons, neue km pro Woche, nach Strassentyp, Fahrten, Fahrzeit,
   Höchstgeschwindigkeit, Auto/Motorrad (in der Fahrtenliste auf 🚗 tippen zum Umschalten)
+- **Weltweit**: Fahrten ausserhalb von Zürich leuchten als GPS-Spur, Statistik pro Land,
+  „Alle Fahrten auf der Karte zeigen“ (Ländergrenzen: Natural Earth, Public Domain)
 - GPX-Import (z. B. alte Aufzeichnungen)
 
 ## Wie „erkundet“ berechnet wird
