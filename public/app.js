@@ -1246,6 +1246,111 @@ async function uploadBatch(b) {
   }
 }
 
+// ───────────────────────── Foto-Import (Fahrten aus Foto-Orten rekonstruieren) ─────────────────────────
+const OSRM = 'https://router.project-osrm.org/route/v1/driving/';
+const PHOTO = { stayR: 400, minLeg: 2000, maxGap: 4 * 864e5, maxLeg: 1500e3, maxDetour: 2.5, slack: 1.15 };
+
+function parsePhotos(text) {
+  const out = [];
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.trim().split(/[;,\t]/);
+    if (m.length < 3) continue;
+    const t = Date.parse(m[0]), lat = parseFloat(m[1]), lon = parseFloat(m[2]);
+    if (!Number.isFinite(t) || !Number.isFinite(lat) || !Number.isFinite(lon) || (lat === 0 && lon === 0)) continue;
+    out.push({ t, lat, lon });
+  }
+  out.sort((a, b) => a.t - b.t);
+  return out.filter((p, i) => i === 0 || p.t !== out[i - 1].t);
+}
+
+// Aufenthalte (Fotos am selben Ort) und daraus mögliche Fahrten
+function photoLegs(photos) {
+  const stays = [];
+  for (const p of photos) {
+    const s = stays[stays.length - 1];
+    if (s && haversine(s.lat, s.lon, p.lat, p.lon) < PHOTO.stayR) s.end = p.t;
+    else stays.push({ lat: p.lat, lon: p.lon, start: p.t, end: p.t });
+  }
+  const legs = [], skipped = { walk: 0, gap: 0, far: 0 };
+  for (let i = 1; i < stays.length; i++) {
+    const A = stays[i - 1], B = stays[i];
+    const d = haversine(A.lat, A.lon, B.lat, B.lon), dt = B.start - A.end;
+    if (d < PHOTO.minLeg) { skipped.walk++; continue; }
+    if (dt <= 0 || dt > PHOTO.maxGap) { skipped.gap++; continue; }
+    if (d > PHOTO.maxLeg) { skipped.far++; continue; }
+    legs.push({ A, B, d, dt });
+  }
+  return { legs, skipped, stays: stays.length };
+}
+
+async function routeLeg(leg) {
+  const url = `${OSRM}${leg.A.lon.toFixed(5)},${leg.A.lat.toFixed(5)};${leg.B.lon.toFixed(5)},${leg.B.lat.toFixed(5)}?overview=full&geometries=geojson`;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await fetch(url);
+      if (r.status === 429) { await new Promise(res => setTimeout(res, 3000)); continue; }
+      const j = await r.json();
+      if (j.code !== 'Ok' || !j.routes?.length) return { why: 'noroute' };
+      const rt = j.routes[0];
+      if (rt.distance > PHOTO.maxDetour * leg.d + 5000) return { why: 'detour' };
+      if (rt.duration > leg.dt * PHOTO.slack) return { why: 'slow' };
+      return { coords: rt.geometry.coordinates, dist: rt.distance, dur: rt.duration };
+    } catch { await new Promise(res => setTimeout(res, 2000)); }
+  }
+  return { why: 'error' };
+}
+
+// Route → künstliche GPS-Punkte mit plausiblen Zeitstempeln (Fahrt mittig in der Lücke)
+function routeToPoints(leg, rt, b) {
+  const pts = [];
+  for (let i = 0; i < rt.coords.length; i++) {
+    const [lon, lat] = rt.coords[i];
+    if (i) {
+      const [plon, plat] = rt.coords[i - 1];
+      const d = haversine(plat, plon, lat, lon), n = Math.ceil(d / 200);
+      for (let k = 1; k < n; k++) pts.push([plon + (lon - plon) * k / n, plat + (lat - plat) * k / n]);
+    }
+    pts.push([lon, lat]);
+  }
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + haversine(pts[i - 1][1], pts[i - 1][0], pts[i][1], pts[i][0]));
+  const L = cum[cum.length - 1] || 1, dur = Math.min(rt.dur, leg.dt * 0.95) * 1000;
+  const start = leg.A.end + Math.max(0, (leg.dt - dur) / 2);
+  for (let i = 0; i < pts.length; i++) {
+    b.t.push(Math.round(start + dur * cum[i] / L)); b.lat.push(pts[i][1]); b.lon.push(pts[i][0]); b.acc.push(15); b.spd.push(null);
+  }
+}
+
+async function importPhotos(file) {
+  const photos = parsePhotos(await file.text());
+  if (photos.length < 2) { toast('Keine Foto-Orte in der Datei gefunden', 4000); return; }
+  const { legs, skipped, stays } = photoLegs(photos);
+  if (!legs.length) { toast('Keine Fahrten erkennbar', 4000); return; }
+  const b = { t: [], lat: [], lon: [], acc: [], spd: [] };
+  const why = { noroute: 0, detour: 0, slow: 0, error: 0 };
+  let ok = 0, dist = 0, last = 0;
+  try {
+    for (let i = 0; i < legs.length; i++) {
+      setLoading(`Fahrten aus Fotos rekonstruieren … ${i + 1}/${legs.length}\n(${ok} gefunden)`);
+      const wait = 1100 - (Date.now() - last);
+      if (wait > 0) await new Promise(r => setTimeout(r, wait)); // Routendienst: max. ~1 Anfrage/s
+      last = Date.now();
+      const rt = await routeLeg(legs[i]);
+      if (rt.why) { why[rt.why]++; continue; }
+      routeToPoints(legs[i], rt, b);
+      ok++; dist += rt.dist;
+    }
+  } finally { setLoading(null); }
+  if (!b.t.length) { toast('Keine plausiblen Autofahrten gefunden', 4000); return; }
+  await idb.addBatch(b);
+  await ingest(b);
+  if (cfg.url && cfg.token) uploadBatch(b).catch(() => toast('Nur lokal gespeichert (Upload fehlgeschlagen)'));
+  const skip = skipped.walk + skipped.gap + skipped.far + why.noroute + why.detour + why.slow + why.error;
+  const msg = `${photos.length} Fotos · ${stays} Orte → ${ok} Fahrten (${km(dist)} km) rekonstruiert, ${skip} übersprungen`;
+  $('photoInfo').textContent = `${msg}. Übersprungen: ${skipped.walk} zu kurz, ${skipped.gap} zu lange Pause, ${skipped.far + why.detour} zu weit/Umweg, ${why.slow} zu schnell für Auto (Flug/Zug), ${why.noroute + why.error} ohne Route.`;
+  toast(`${ok} Fahrten aus Fotos rekonstruiert`, 5000);
+}
+
 // ───────────────────────── Einstellungen ─────────────────────────
 function overlandUrl() {
   if (!cfg.url || !cfg.token) return '';
@@ -1311,6 +1416,7 @@ function bindUi() {
     cfg.network = e.target.checked; saveCfg();
     if (mapReady) map.setLayoutProperty('network', 'visibility', cfg.network ? 'visible' : 'none');
   });
+  $('photoInput').addEventListener('change', async e => { const f = e.target.files[0]; e.target.value = ''; if (f) await importPhotos(f); });
   $('gpxInput').addEventListener('change', async e => { const f = [...e.target.files]; e.target.value = ''; if (f.length) await importGpx(f); });
   $('recompute').addEventListener('click', async () => {
     setLoading('Berechne neu …'); await tick();
@@ -1372,7 +1478,7 @@ async function main() {
 }
 
 // Für Tests
-window.__erkunder = { get R() { return R; }, get CF() { return CF; }, get P() { return P; }, computeTrips, coverageStats, findTarget, importGpx, drive, onDrivePos, planRoute, computeTracks, get TRACKS() { return TRACKS; }, get route() { return route; }, get G() { return G; } };
+window.__erkunder = { get R() { return R; }, get CF() { return CF; }, get P() { return P; }, computeTrips, coverageStats, findTarget, importGpx, drive, onDrivePos, planRoute, computeTracks, parsePhotos, photoLegs, routeToPoints, importPhotos, get TRACKS() { return TRACKS; }, get route() { return route; }, get G() { return G; } };
 
 main();
 })();

@@ -109,6 +109,7 @@ input[type=url], input[type=text] { width: 100%; margin-top: 4px; padding: 10px 
 #toast { position: fixed; top: calc(var(--sat) + 140px); left: 50%; transform: translateX(-50%); z-index: 20;
   background: linear-gradient(135deg, #00c8e0, #0091ff); color: #001018; font-weight: 800; padding: 10px 18px;
   border-radius: 999px; box-shadow: 0 6px 30px rgba(0,200,255,.45); white-space: nowrap; max-width: calc(100vw - 32px); overflow: hidden; text-overflow: ellipsis; }
+#loadingText { white-space: pre-line; }
 #loading { position: fixed; inset: 0; z-index: 30; background: var(--bg); display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: 16px; color: var(--muted); padding: 20px; text-align: center; }
 .spinner { width: 36px; height: 36px; border: 3px solid rgba(255,255,255,.1); border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; }

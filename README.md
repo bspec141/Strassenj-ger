@@ -51,6 +51,7 @@ Fertig: Overland schickt die Punkte automatisch, die Web-App holt sie beim Öffn
   Höchstgeschwindigkeit, Auto/Motorrad (in der Fahrtenliste auf 🚗 tippen zum Umschalten)
 - **Weltweit**: Fahrten ausserhalb von Zürich leuchten als GPS-Spur, Statistik pro Land,
   „Alle Fahrten auf der Karte zeigen“ (Ländergrenzen: Natural Earth, Public Domain)
+- **Foto-Import**: rekonstruiert Autofahrten aus Datum + Ort deiner Fotos (Routen: OSRM)
 - GPX-Import (z. B. alte Aufzeichnungen)
 
 ## Wie „erkundet“ berechnet wird
