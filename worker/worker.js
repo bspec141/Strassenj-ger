@@ -6,7 +6,8 @@
 //
 // Endpunkte (alle brauchen ?token=… oder "Authorization: Bearer …"):
 //   POST /api/overland        Overland-GPS-Punkte empfangen
-//   GET  /api/points?after=ID Punkte abholen (nach Empfangs-ID)
+//   GET  /api/chunks?after=ID Punkte-Pakete abholen (ein DB-Eintrag pro empfangenem Paket)
+//   GET  /api/points?after=ID ältere Einzelpunkte abholen (aus Version 1)
 //   GET  /api/tags            Fahrzeug-Zuordnung der Fahrten
 //   PUT  /api/tags            {start, vehicle} setzen (vehicle null = löschen)
 //   GET  /api/ping            Verbindungstest
@@ -18,6 +19,8 @@ const SCHEMA = [
      lat REAL NOT NULL, lon REAL NOT NULL,
      acc REAL, spd REAL)`,
   `CREATE TABLE IF NOT EXISTS tags (start INTEGER PRIMARY KEY, vehicle TEXT NOT NULL)`,
+  // Ein Eintrag pro Paket statt pro Punkt → spart Schreibvorgänge (Gratis-Tarif: 100'000/Tag)
+  `CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, n INTEGER NOT NULL, data TEXT NOT NULL)`,
 ];
 let schemaReady = false;
 
@@ -54,11 +57,13 @@ export default {
       switch (`${req.method} ${url.pathname}`) {
         case 'POST /api/overland': return await receive(req, env);
         case 'GET /api/points': return await points(url, env);
+        case 'GET /api/chunks': return await chunks(url, env);
         case 'GET /api/tags': return await getTags(env);
         case 'PUT /api/tags': return await putTag(req, env);
         case 'GET /api/ping': {
-          const r = await env.DB.prepare('SELECT COUNT(*) AS n, MAX(t) AS last FROM points').first();
-          return json({ ok: true, count: r.n, last: r.last });
+          const a = await env.DB.prepare('SELECT COUNT(*) AS n FROM points').first();
+          const b = await env.DB.prepare('SELECT COALESCE(SUM(n), 0) AS n FROM chunks').first();
+          return json({ ok: true, count: a.n + b.n, version: 2 });
         }
       }
       return json({ error: 'not found' }, 404);
@@ -80,9 +85,10 @@ async function receive(req, env) {
     const acc = num(p.horizontal_accuracy), spd = num(p.speed);
     rows.push([t, lat, lon, acc != null && acc >= 0 ? acc : null, spd != null && spd >= 0 ? spd : null]);
   }
-  const stmt = env.DB.prepare('INSERT OR IGNORE INTO points (t, lat, lon, acc, spd) VALUES (?, ?, ?, ?, ?)');
-  for (let i = 0; i < rows.length; i += 400) {
-    await env.DB.batch(rows.slice(i, i + 400).map(r => stmt.bind(...r)));
+  // Pakete à max. 2000 Punkte (D1: max. ~1 MB pro Wert)
+  for (let i = 0; i < rows.length; i += 2000) {
+    const part = rows.slice(i, i + 2000);
+    await env.DB.prepare('INSERT INTO chunks (n, data) VALUES (?, ?)').bind(part.length, JSON.stringify(part)).run();
   }
   // Overland löscht seine Warteschlange nur bei genau dieser Antwort
   return json({ result: 'ok', saved: rows.length });
@@ -95,6 +101,13 @@ async function points(url, env) {
     .prepare('SELECT id, t, lat, lon, acc, spd FROM points WHERE id > ? ORDER BY id LIMIT ?')
     .bind(after, limit).all();
   return json({ points: results.map(r => [r.id, r.t, r.lat, r.lon, r.acc, r.spd]) });
+}
+
+async function chunks(url, env) {
+  const after = Math.max(0, parseInt(url.searchParams.get('after') || '0', 10) || 0);
+  const { results } = await env.DB
+    .prepare('SELECT id, data FROM chunks WHERE id > ? ORDER BY id LIMIT 50').bind(after).all();
+  return json({ chunks: results.map(r => ({ id: r.id, points: JSON.parse(r.data) })) });
 }
 
 async function getTags(env) {

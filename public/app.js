@@ -1178,6 +1178,17 @@ async function sync(manual) {
       after = points[points.length - 1][0];
       if (points.length < 5000) break;
     }
+    // Neue Paket-Speicherung (Worker Version 2)
+    let afterChunk = (await idb.get('lastChunk')) || 0, gotChunks = false;
+    try {
+      for (;;) {
+        const { chunks } = await api(`/api/chunks?after=${afterChunk}`);
+        if (!chunks?.length) break;
+        for (const c of chunks) for (const p of c.points) got.push([0, ...p]);
+        afterChunk = chunks[chunks.length - 1].id; gotChunks = true;
+        if (chunks.length < 50) break;
+      }
+    } catch {} // alter Worker ohne /api/chunks
     try {
       const r = await api('/api/tags');
       tags = r.tags || {};
@@ -1189,6 +1200,7 @@ async function sync(manual) {
       for (const p of got) { b.t.push(p[1]); b.lat.push(p[2]); b.lon.push(p[3]); b.acc.push(p[4]); b.spd.push(p[5]); }
       await idb.addBatch(b);
       await idb.set('lastId', after);
+      if (gotChunks) await idb.set('lastChunk', afterChunk);
       await ingest(b);
     } else if (manual) toast('Keine neuen Punkte');
     renderHud();
